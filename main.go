@@ -178,7 +178,10 @@ func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *ht
 		Certificates: []tls.Certificate{*tlsCert},
 		NextProtos:   []string{"http/1.1"}, // Phase 3a: HTTP/1.1 only; H2 in next phase.
 	})
-	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+	// G1: timeout on client TLS handshake to prevent slow-client DoS.
+	hsCtx, hsCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer hsCancel()
+	if err := tlsConn.HandshakeContext(hsCtx); err != nil {
 		slog.Error("client tls handshake failed", "error", err)
 		return
 	}
@@ -282,6 +285,10 @@ func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *ht
 			"path", req.URL.Path,
 		)
 
+		// C2: set resp.Request so resp.Write knows the method (HEAD
+		// responses must not write a body).
+		resp.Request = req
+
 		// R1: ensure resp.Body is always closed, even on write errors.
 		writeErr := resp.Write(tlsConn)
 		resp.Body.Close()
@@ -314,16 +321,25 @@ func (p *proxy) handlePassthrough(clientConn net.Conn, _ *bufio.Reader, connectR
 
 	fmt.Fprintf(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 
+	// R2: set idle timeout on passthrough connections to prevent
+	// indefinite goroutine hangs on stale connections.
+	idleTimeout := 5 * time.Minute
+	deadline := time.Now().Add(idleTimeout)
+	clientConn.SetDeadline(deadline)
+	upstreamConn.SetDeadline(deadline)
+
 	// Bidirectional copy.
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		io.Copy(upstreamConn, clientConn)
+		upstreamConn.Close()
 	}()
 	go func() {
 		defer wg.Done()
 		io.Copy(clientConn, upstreamConn)
+		clientConn.Close()
 	}()
 	wg.Wait()
 }
@@ -434,9 +450,18 @@ func loadCA(certPath, keyPath string) (*x509.Certificate, *ecdsa.PrivateKey, err
 	if block == nil {
 		return nil, nil, fmt.Errorf("no PEM block in ca key")
 	}
+	// G2: try SEC 1 (EC PRIVATE KEY) first, then PKCS8 (PRIVATE KEY).
 	keyRaw, err := x509.ParseECPrivateKey(block.Bytes)
 	if err != nil {
-		return nil, nil, fmt.Errorf("parse ca key: %w", err)
+		pkcs8Key, pkcs8Err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if pkcs8Err != nil {
+			return nil, nil, fmt.Errorf("parse ca key (tried EC and PKCS8): EC=%w, PKCS8=%v", err, pkcs8Err)
+		}
+		ecKey, ok := pkcs8Key.(*ecdsa.PrivateKey)
+		if !ok {
+			return nil, nil, fmt.Errorf("ca key is PKCS8 but not ECDSA (got %T)", pkcs8Key)
+		}
+		keyRaw = ecKey
 	}
 
 	return cert, keyRaw, nil
@@ -483,7 +508,8 @@ func generateEphemeralCA() (*x509.Certificate, *ecdsa.PrivateKey, error) {
 	tmpDir, _ := os.MkdirTemp("", "agent-proxy-ca-*")
 	os.WriteFile(tmpDir+"/ca.crt", certPEM, 0644)
 	os.WriteFile(tmpDir+"/ca.key", keyPEM, 0600)
-	slog.Info("ephemeral ca written", "dir", tmpDir)
+	// S5: only log the cert path (public), not the key path.
+	slog.Info("ephemeral ca written", "cert", tmpDir+"/ca.crt")
 
 	return cert, key, nil
 }

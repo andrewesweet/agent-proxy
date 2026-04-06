@@ -14,7 +14,17 @@ type CredentialMutator func(req *http.Request) error
 
 // StaticTokenMutator returns a CredentialMutator that sets a fixed header
 // value on every request. Suitable for PATs, API keys, and registry tokens.
+// Panics if headerName is empty or contains invalid characters.
 func StaticTokenMutator(headerName, headerValue string) CredentialMutator {
+	// S4: validate header name at construction time.
+	if headerName == "" {
+		panic("empty header name")
+	}
+	for _, c := range headerName {
+		if c <= ' ' || c == ':' || c >= 0x7f {
+			panic(fmt.Sprintf("invalid character %q in header name %q", c, headerName))
+		}
+	}
 	return func(req *http.Request) error {
 		req.Header.Set(headerName, headerValue)
 		return nil

@@ -53,3 +53,25 @@ See `docs/research-plan.md` for the full research trail. Summary:
 - **nftables netns redirect** (planned) — not HTTP_PROXY env vars
 - **Certificate cache** keyed by hostname with LRU eviction (planned)
 - **CONNECT host == Host header == SNI** — all three must agree or reject
+
+## Productionisation Checklist
+
+If this prototype is promoted to a production tool, port the following from
+[spnego-proxy](https://github.com/andrewesweet/spnego-proxy):
+
+- [ ] **Linting:** golangci-lint configuration and CI integration
+- [ ] **Static analysis:** CodeQL workflow for Go security scanning
+- [ ] **Branch protection / rulesets:** require PR reviews, status checks,
+      signed commits, linear history
+- [ ] **Auto-tag release process:** git-cliff conventional-commit-driven
+      versioning, changelog generation, and automatic tagging on merge
+- [ ] **Release pipeline:** cross-platform builds, archive packaging,
+      GitHub Attestations for supply chain integrity
+- [ ] **SemVer contract:** define the public API surface (CLI flags, exit
+      codes, proxy behavior) for versioning purposes
+- [ ] **Threat model:** formal threat model document (adapt spnego-proxy's
+      P1-P5 structure to agent-proxy's expanded attack surface)
+- [ ] **Contributing guide:** CONTRIBUTING.md with release process docs
+- [ ] **Dependabot / dependency management:** automated dependency updates
+- [ ] **Separate systemd units:** distinct UIDs, ProtectSystem=strict,
+      PrivateTmp=true (per N8 resolution)

@@ -52,11 +52,11 @@ func TestMITMInjection(t *testing.T) {
 				return net.DialTimeout(network, addr, 5*time.Second)
 			},
 		},
-		destHost:     "test.example.com",
-		token:        "ghp_FAKE_TEST_TOKEN_12345",
-		headerName:   "Authorization",
-		headerPrefix: "token ",
-		certCache:    cc,
+		rules: NewRuleSet(Rule{
+			Host:    "test.example.com",
+			Mutator: StaticGitHubTokenMutator("ghp_FAKE_TEST_TOKEN_12345"),
+		}),
+		certCache: cc,
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -139,11 +139,11 @@ func TestHostMismatchRejection(t *testing.T) {
 	cc := newCertCache(ca, caKey)
 
 	p := &proxy{
-		destHost:     "test.example.com",
-		token:        "secret",
-		headerName:   "Authorization",
-		headerPrefix: "Bearer ",
-		certCache:    cc,
+		rules: NewRuleSet(Rule{
+			Host:    "test.example.com",
+			Mutator: StaticBearerMutator("secret"),
+		}),
+		certCache: cc,
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -223,8 +223,10 @@ func TestPassthrough(t *testing.T) {
 	cc := newCertCache(ca, caKey)
 
 	p := &proxy{
-		destHost:  "intercepted.example.com",
-		token:     "secret",
+		rules: NewRuleSet(Rule{
+			Host:    "intercepted.example.com",
+			Mutator: StaticBearerMutator("secret"),
+		}),
 		certCache: cc,
 	}
 

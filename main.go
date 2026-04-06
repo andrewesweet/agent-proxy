@@ -64,12 +64,17 @@ func main() {
 
 	certCache := newCertCache(ca, caKey)
 
+	// Build rules from CLI flags. In future phases this will come from
+	// a config file or per-container socket identity.
+	rules := NewRuleSet(Rule{
+		Host:    *destHost,
+		Mutator: StaticTokenMutator(*headerName, *headerPrefix+*token),
+	})
+	slog.Info("rules loaded", "rules", rules.String())
+
 	p := &proxy{
-		destHost:     *destHost,
-		token:        *token,
-		headerName:   *headerName,
-		headerPrefix: *headerPrefix,
-		certCache:    certCache,
+		rules:     rules,
+		certCache: certCache,
 	}
 
 	ln, err := net.Listen("tcp", *listen)
@@ -94,11 +99,8 @@ func main() {
 
 // proxy holds the configuration for the MITM proxy.
 type proxy struct {
-	destHost     string
-	token        string
-	headerName   string
-	headerPrefix string
-	certCache    *certCache
+	rules     *RuleSet
+	certCache *certCache
 
 	// transport is used for forwarding intercepted requests upstream.
 	// If nil, http.DefaultTransport is used.
@@ -138,8 +140,8 @@ func (p *proxy) handleConn(clientConn net.Conn) {
 
 	slog.Debug("connect", "host", host, "dest", req.Host)
 
-	if host == p.destHost {
-		p.handleMITM(clientConn, br, req)
+	if mutator := p.rules.Match(host); mutator != nil {
+		p.handleMITM(clientConn, br, req, host, mutator)
 	} else {
 		p.handlePassthrough(clientConn, br, req)
 	}
@@ -148,15 +150,15 @@ func (p *proxy) handleConn(clientConn net.Conn) {
 // handleMITM performs TLS interception: we tell the client CONNECT succeeded,
 // perform a TLS handshake using a generated cert, read the plaintext HTTP
 // request, inject credentials, and forward to the real destination.
-func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *http.Request) {
+func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *http.Request, destHost string, mutator CredentialMutator) {
 	// Tell client CONNECT succeeded. We don't pre-dial upstream here;
 	// each HTTP request is forwarded independently via the transport.
 	fmt.Fprintf(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 
 	// TLS handshake with the client using a generated cert for the dest host.
-	tlsCert, err := p.certCache.getCert(p.destHost)
+	tlsCert, err := p.certCache.getCert(destHost)
 	if err != nil {
-		slog.Error("cert generation failed", "host", p.destHost, "error", err)
+		slog.Error("cert generation failed", "host", destHost, "error", err)
 		return
 	}
 
@@ -171,7 +173,7 @@ func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *ht
 	defer tlsConn.Close()
 
 	slog.Debug("mitm_tls_established",
-		"host", p.destHost,
+		"host", destHost,
 		"client_proto", tlsConn.ConnectionState().NegotiatedProtocol,
 	)
 
@@ -192,9 +194,9 @@ func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *ht
 		if h, _, err := net.SplitHostPort(reqHost); err == nil {
 			reqHost = h
 		}
-		if reqHost != p.destHost {
+		if reqHost != destHost {
 			slog.Warn("host_mismatch",
-				"connect_host", p.destHost,
+				"connect_host", destHost,
 				"request_host", reqHost,
 			)
 			resp := &http.Response{
@@ -210,19 +212,20 @@ func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *ht
 			return
 		}
 
-		// Inject credential.
-		if p.token != "" {
-			req.Header.Set(p.headerName, p.headerPrefix+p.token)
-			slog.Debug("credential_injected",
-				"host", p.destHost,
-				"method", req.Method,
-				"path", req.URL.Path,
-			)
+		// Inject credential via the mutator.
+		if err := mutator(req); err != nil {
+			slog.Error("credential injection failed", "host", destHost, "error", err)
+			return
 		}
+		slog.Debug("credential_injected",
+			"host", destHost,
+			"method", req.Method,
+			"path", req.URL.Path,
+		)
 
 		// Fix the request URL for direct connection (not proxy form).
 		req.URL.Scheme = "https"
-		req.URL.Host = p.destHost
+		req.URL.Host = destHost
 		req.RequestURI = "" // Required for http.Client / Transport.
 
 		// Forward to upstream.

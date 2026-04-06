@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"strings"
 )
 
 // CredentialMutator modifies an HTTP request to inject credentials.
@@ -46,14 +47,21 @@ type RuleSet struct {
 	rules []Rule
 }
 
-// NewRuleSet creates a RuleSet from the given rules.
+// NewRuleSet creates a RuleSet from the given rules. Host values are
+// normalized to lowercase.
 func NewRuleSet(rules ...Rule) *RuleSet {
-	return &RuleSet{rules: rules}
+	normalized := make([]Rule, len(rules))
+	for i, r := range rules {
+		r.Host = strings.ToLower(r.Host)
+		normalized[i] = r
+	}
+	return &RuleSet{rules: normalized}
 }
 
 // Match returns the CredentialMutator for the given host, or nil if no
-// rule matches. First match wins.
+// rule matches. Host comparison is case-insensitive. First match wins.
 func (rs *RuleSet) Match(host string) CredentialMutator {
+	host = strings.ToLower(host)
 	for _, r := range rs.rules {
 		if r.Host == host {
 			return r.Mutator

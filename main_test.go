@@ -227,7 +227,8 @@ func TestPassthrough(t *testing.T) {
 			Host:    "intercepted.example.com",
 			Mutator: StaticBearerMutator("secret"),
 		}),
-		certCache: cc,
+		allowPassthrough: true, // Passthrough test needs this enabled.
+		certCache:        cc,
 	}
 
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")

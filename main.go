@@ -102,6 +102,10 @@ type proxy struct {
 	rules     *RuleSet
 	certCache *certCache
 
+	// allowPassthrough controls whether CONNECT to non-ruled hosts is
+	// permitted. If false (default), non-ruled destinations are rejected.
+	allowPassthrough bool
+
 	// transport is used for forwarding intercepted requests upstream.
 	// If nil, http.DefaultTransport is used.
 	transport http.RoundTripper
@@ -119,6 +123,11 @@ func (p *proxy) roundTripper() http.RoundTripper {
 // tunnel blindly (passthrough).
 func (p *proxy) handleConn(clientConn net.Conn) {
 	defer clientConn.Close()
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("panic in connection handler", "panic", r)
+		}
+	}()
 
 	br := bufio.NewReader(clientConn)
 	req, err := http.ReadRequest(br)
@@ -128,7 +137,6 @@ func (p *proxy) handleConn(clientConn net.Conn) {
 	}
 
 	if req.Method != http.MethodConnect {
-		// Non-CONNECT: out of scope for this prototype.
 		fmt.Fprintf(clientConn, "HTTP/1.1 405 Method Not Allowed\r\n\r\n")
 		return
 	}
@@ -137,13 +145,17 @@ func (p *proxy) handleConn(clientConn net.Conn) {
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
+	host = strings.ToLower(host) // S2: case-insensitive host matching.
 
 	slog.Debug("connect", "host", host, "dest", req.Host)
 
 	if mutator := p.rules.Match(host); mutator != nil {
 		p.handleMITM(clientConn, br, req, host, mutator)
-	} else {
+	} else if p.allowPassthrough {
 		p.handlePassthrough(clientConn, br, req)
+	} else {
+		slog.Warn("connect_denied", "host", host)
+		fmt.Fprintf(clientConn, "HTTP/1.1 403 Forbidden\r\n\r\n")
 	}
 }
 
@@ -172,9 +184,21 @@ func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *ht
 	}
 	defer tlsConn.Close()
 
+	// S1: Verify SNI matches the CONNECT host.
+	cs := tlsConn.ConnectionState()
+	sniHost := strings.ToLower(cs.ServerName)
+	if sniHost != "" && sniHost != destHost {
+		slog.Warn("sni_mismatch",
+			"connect_host", destHost,
+			"sni", sniHost,
+		)
+		return
+	}
+
 	slog.Debug("mitm_tls_established",
 		"host", destHost,
-		"client_proto", tlsConn.ConnectionState().NegotiatedProtocol,
+		"client_proto", cs.NegotiatedProtocol,
+		"sni", sniHost,
 	)
 
 	// Read/write loop: read HTTP/1.1 requests from client, inject header,
@@ -190,7 +214,7 @@ func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *ht
 		}
 
 		// Enforce host consistency (U1 resolution: CONNECT host == Host header).
-		reqHost := req.Host
+		reqHost := strings.ToLower(req.Host)
 		if h, _, err := net.SplitHostPort(reqHost); err == nil {
 			reqHost = h
 		}
@@ -233,16 +257,23 @@ func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *ht
 		if err != nil {
 			slog.Error("upstream request failed", "error", err)
 			errResp := &http.Response{
-				StatusCode: http.StatusBadGateway,
-				Status:     "502 Bad Gateway",
-				Proto:      "HTTP/1.1",
-				ProtoMajor: 1,
-				ProtoMinor: 1,
-				Header:     http.Header{},
-				Body:       io.NopCloser(strings.NewReader("")),
+				StatusCode:    http.StatusBadGateway,
+				Status:        "502 Bad Gateway",
+				Proto:         "HTTP/1.1",
+				ProtoMajor:    1,
+				ProtoMinor:    1,
+				Header:        http.Header{"Content-Length": {"0"}},
+				Body:          io.NopCloser(strings.NewReader("")),
+				ContentLength: 0,
 			}
 			errResp.Write(tlsConn)
-			return
+			// C1: continue the keep-alive loop; don't kill the session
+			// on a single upstream failure. Only break if the client
+			// asked to close.
+			if req.Close {
+				return
+			}
+			continue
 		}
 
 		slog.Debug("upstream_response",
@@ -251,12 +282,13 @@ func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *ht
 			"path", req.URL.Path,
 		)
 
-		// Write response back to client.
-		if err := resp.Write(tlsConn); err != nil {
-			slog.Debug("write response to client", "error", err)
+		// R1: ensure resp.Body is always closed, even on write errors.
+		writeErr := resp.Write(tlsConn)
+		resp.Body.Close()
+		if writeErr != nil {
+			slog.Debug("write response to client", "error", writeErr)
 			return
 		}
-		resp.Body.Close()
 
 		// If the response indicated connection close, stop.
 		if resp.Close || req.Close {

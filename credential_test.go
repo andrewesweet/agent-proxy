@@ -372,6 +372,57 @@ func TestOAuthRefreshMutator_MutateResponse_NonTokenEndpoint(t *testing.T) {
 	}
 }
 
+func TestOAuthBearerMutator_OverwritesUnconditionally(t *testing.T) {
+	m := NewOAuthRefreshMutator("real-refresh-token")
+	m.mu.Lock()
+	m.cachedToken = "ya29.real-token"
+	m.cachedExpiry = time.Now().Add(30 * time.Minute)
+	m.mu.Unlock()
+
+	bearer := NewOAuthBearerMutator(m)
+	req, _ := http.NewRequest("GET", "https://cloudresourcemanager.googleapis.com/v1/projects", nil)
+	req.Header.Set("Authorization", "Bearer "+DummyAccessToken)
+
+	if err := bearer.MutateRequest(context.Background(), req); err != nil {
+		t.Fatalf("MutateRequest error: %v", err)
+	}
+
+	if got := req.Header.Get("Authorization"); got != "Bearer ya29.real-token" {
+		t.Errorf("Authorization = %q, want %q", got, "Bearer ya29.real-token")
+	}
+}
+
+func TestOAuthBearerMutator_OverwritesArbitraryValue(t *testing.T) {
+	m := NewOAuthRefreshMutator("real-refresh-token")
+	m.mu.Lock()
+	m.cachedToken = "ya29.real-token"
+	m.cachedExpiry = time.Now().Add(30 * time.Minute)
+	m.mu.Unlock()
+
+	bearer := NewOAuthBearerMutator(m)
+	req, _ := http.NewRequest("GET", "https://example.com/api", nil)
+	req.Header.Set("Authorization", "Bearer some-completely-different-value")
+
+	if err := bearer.MutateRequest(context.Background(), req); err != nil {
+		t.Fatalf("MutateRequest error: %v", err)
+	}
+
+	if got := req.Header.Get("Authorization"); got != "Bearer ya29.real-token" {
+		t.Errorf("Authorization = %q, want %q", got, "Bearer ya29.real-token")
+	}
+}
+
+func TestOAuthBearerMutator_ErrorOnEmptyCache(t *testing.T) {
+	m := NewOAuthRefreshMutator("real-refresh-token")
+	bearer := NewOAuthBearerMutator(m)
+	req, _ := http.NewRequest("GET", "https://example.com/api", nil)
+
+	err := bearer.MutateRequest(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected error on empty cache, got nil")
+	}
+}
+
 // ---- test helpers ----
 
 func newTestTLSServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {

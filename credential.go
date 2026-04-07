@@ -220,6 +220,35 @@ func (m *OAuthRefreshMutator) MutateResponse(_ context.Context, req *http.Reques
 	return nil
 }
 
+// OAuthBearerMutator handles API hosts by replacing the Authorization
+// header with the real access token from a TokenProvider.
+type OAuthBearerMutator struct {
+	tokenProvider TokenProvider
+}
+
+// NewOAuthBearerMutator creates a mutator for API hosts. It reads the
+// current access token from the given TokenProvider on each request.
+func NewOAuthBearerMutator(tp TokenProvider) *OAuthBearerMutator {
+	return &OAuthBearerMutator{tokenProvider: tp}
+}
+
+// MutateRequest unconditionally replaces the Authorization header with
+// the cached real access token. Returns an error if no valid token is
+// available (cold start or expiry).
+func (m *OAuthBearerMutator) MutateRequest(_ context.Context, req *http.Request) error {
+	token, err := m.tokenProvider.AccessToken()
+	if err != nil {
+		return fmt.Errorf("oauth bearer: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	return nil
+}
+
+// MutateResponse is a no-op for API hosts.
+func (m *OAuthBearerMutator) MutateResponse(_ context.Context, _ *http.Request, _ *http.Response) error {
+	return nil
+}
+
 // Rule maps a destination host to a credential mutator.
 type Rule struct {
 	// Host is the destination hostname to match (exact match).

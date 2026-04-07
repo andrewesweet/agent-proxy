@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -367,4 +368,161 @@ func TestPassthrough(t *testing.T) {
 
 	body, _ := io.ReadAll(innerResp.Body)
 	t.Logf("Passthrough verified: %s", string(body))
+}
+
+// TestOAuthRefreshFlow verifies the complete OAuth token exchange flow:
+// 1. Client sends POST /token with dummy refresh_token
+// 2. Proxy swaps for real refresh_token, forwards to token endpoint
+// 3. Token endpoint returns real access_token
+// 4. Proxy caches real access_token, returns dummy to client
+// 5. Client sends API request with dummy access_token
+// 6. Proxy replaces with real access_token, forwards to API
+// 7. API endpoint receives real access_token, returns 200
+func TestOAuthRefreshFlow(t *testing.T) {
+	var gotRefreshToken string
+	var gotAPIAuth string
+
+	// Mock token endpoint: expects real refresh_token, returns real access_token.
+	tokenEndpoint := newTestTLSServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		vals, _ := url.ParseQuery(string(body))
+		gotRefreshToken = vals.Get("refresh_token")
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"access_token":"ya29.real-access-token","expires_in":3600,"token_type":"Bearer"}`)
+	})
+	defer tokenEndpoint.Close()
+
+	// Mock API endpoint: expects real access_token.
+	apiEndpoint := newTestTLSServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotAPIAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"projects":[{"id":"test-project"}]}`)
+	})
+	defer apiEndpoint.Close()
+
+	ca, caKey, _ := generateEphemeralCA()
+	cc := newCertCache(ca, caKey)
+
+	tokenAddr := tokenEndpoint.Listener.Addr().String()
+	apiAddr := apiEndpoint.Listener.Addr().String()
+
+	refreshMutator := NewOAuthRefreshMutator("real-refresh-token-secret")
+
+	p := &proxy{
+		transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				switch h, _, _ := net.SplitHostPort(addr); h {
+				case "oauth2.googleapis.com":
+					addr = tokenAddr
+				case "cloudresourcemanager.googleapis.com":
+					addr = apiAddr
+				}
+				return net.DialTimeout(network, addr, 5*time.Second)
+			},
+		},
+		rules: NewRuleSet(
+			Rule{Host: "oauth2.googleapis.com", Mutator: refreshMutator},
+			Rule{Host: "cloudresourcemanager.googleapis.com", Mutator: NewOAuthBearerMutator(refreshMutator)},
+		),
+		certCache: cc,
+	}
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go p.handleConn(conn)
+		}
+	}()
+
+	proxyCA := x509.NewCertPool()
+	proxyCA.AddCert(ca)
+
+	// Step 1: Token refresh — POST /token with dummy refresh_token.
+	tokenRespBody := doProxyPost(t, ln.Addr().String(), "oauth2.googleapis.com", "/token",
+		"grant_type=refresh_token&refresh_token=dummy-container-token&client_id=764086051850-test.apps.googleusercontent.com",
+		proxyCA)
+
+	// Verify: proxy sent real refresh_token to upstream.
+	if gotRefreshToken != "real-refresh-token-secret" {
+		t.Errorf("token endpoint got refresh_token = %q, want %q", gotRefreshToken, "real-refresh-token-secret")
+	}
+
+	// Verify: client received dummy access_token (not real).
+	if strings.Contains(tokenRespBody, "ya29.real-access-token") {
+		t.Error("client received real access token — should have received dummy")
+	}
+	if !strings.Contains(tokenRespBody, DummyAccessToken) {
+		t.Errorf("client response missing dummy token %q, got: %s", DummyAccessToken, tokenRespBody)
+	}
+
+	// Step 2: API request — GET /v1/projects with dummy access_token.
+	apiRespBody := doProxyRequest(t, ln.Addr().String(), "cloudresourcemanager.googleapis.com", proxyCA)
+
+	// Verify: proxy sent real access_token to upstream API.
+	if gotAPIAuth != "Bearer ya29.real-access-token" {
+		t.Errorf("API endpoint got Authorization = %q, want %q", gotAPIAuth, "Bearer ya29.real-access-token")
+	}
+
+	// Verify: client received the API response.
+	if !strings.Contains(apiRespBody, "test-project") {
+		t.Errorf("API response = %q, want to contain 'test-project'", apiRespBody)
+	}
+
+	t.Logf("OAuth flow verified: refresh_token swapped, access_token cached and injected")
+}
+
+// doProxyPost sends a POST request through the proxy and returns the response body.
+func doProxyPost(t *testing.T, proxyAddr, destHost, path, body string, proxyCA *x509.CertPool) string {
+	t.Helper()
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+
+	fmt.Fprintf(conn, "CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n", destHost, destHost)
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("CONNECT response: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("CONNECT = %d", resp.StatusCode)
+	}
+
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName: destHost,
+		RootCAs:    proxyCA,
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("tls: %v", err)
+	}
+	defer tlsConn.Close()
+
+	reqStr := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		path, destHost, len(body), body)
+	if _, err := io.WriteString(tlsConn, reqStr); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	innerResp, err := http.ReadResponse(bufio.NewReader(tlsConn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer innerResp.Body.Close()
+
+	respBody, _ := io.ReadAll(innerResp.Body)
+	return string(respBody)
 }

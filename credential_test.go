@@ -285,6 +285,93 @@ func TestOAuthRefreshMutator_MutateRequest_V4Path(t *testing.T) {
 	}
 }
 
+func TestOAuthRefreshMutator_MutateResponse_CachesAndReplaces(t *testing.T) {
+	m := NewOAuthRefreshMutator("real-refresh-token")
+	tokenResp := `{"access_token":"ya29.real-token","expires_in":3600,"token_type":"Bearer"}`
+
+	req, _ := http.NewRequest("POST", "https://oauth2.googleapis.com/token", nil)
+	resp := &http.Response{
+		StatusCode:    200,
+		Header:        http.Header{"Content-Type": {"application/json"}},
+		Body:          io.NopCloser(strings.NewReader(tokenResp)),
+		ContentLength: int64(len(tokenResp)),
+	}
+
+	if err := m.MutateResponse(context.Background(), req, resp); err != nil {
+		t.Fatalf("MutateResponse error: %v", err)
+	}
+
+	// Check the token was cached.
+	token, err := m.AccessToken()
+	if err != nil {
+		t.Fatalf("AccessToken error after MutateResponse: %v", err)
+	}
+	if token != "ya29.real-token" {
+		t.Errorf("cached token = %q, want %q", token, "ya29.real-token")
+	}
+
+	// Check the response body was modified.
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "ya29.real-token") {
+		t.Error("response body still contains real access token")
+	}
+	if !strings.Contains(string(body), DummyAccessToken) {
+		t.Errorf("response body missing dummy token %q", DummyAccessToken)
+	}
+
+	// Check Content-Length matches the actual body.
+	if resp.ContentLength != int64(len(body)) {
+		t.Errorf("ContentLength = %d, body length = %d", resp.ContentLength, len(body))
+	}
+}
+
+func TestOAuthRefreshMutator_MutateResponse_MasksRotatedRefreshToken(t *testing.T) {
+	m := NewOAuthRefreshMutator("real-refresh-token")
+	tokenResp := `{"access_token":"ya29.real","expires_in":3600,"refresh_token":"1//new-rotated-token","token_type":"Bearer"}`
+
+	req, _ := http.NewRequest("POST", "https://oauth2.googleapis.com/token", nil)
+	resp := &http.Response{
+		StatusCode:    200,
+		Header:        http.Header{"Content-Type": {"application/json"}},
+		Body:          io.NopCloser(strings.NewReader(tokenResp)),
+		ContentLength: int64(len(tokenResp)),
+	}
+
+	if err := m.MutateResponse(context.Background(), req, resp); err != nil {
+		t.Fatalf("MutateResponse error: %v", err)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "1//new-rotated-token") {
+		t.Error("response body still contains rotated refresh token")
+	}
+	if !strings.Contains(string(body), DummyRefreshToken) {
+		t.Errorf("response body missing dummy refresh token %q", DummyRefreshToken)
+	}
+}
+
+func TestOAuthRefreshMutator_MutateResponse_NonTokenEndpoint(t *testing.T) {
+	m := NewOAuthRefreshMutator("real-refresh-token")
+	originalBody := `{"data":"unchanged"}`
+
+	req, _ := http.NewRequest("GET", "https://oauth2.googleapis.com/tokeninfo", nil)
+	resp := &http.Response{
+		StatusCode:    200,
+		Header:        http.Header{"Content-Type": {"application/json"}},
+		Body:          io.NopCloser(strings.NewReader(originalBody)),
+		ContentLength: int64(len(originalBody)),
+	}
+
+	if err := m.MutateResponse(context.Background(), req, resp); err != nil {
+		t.Fatalf("MutateResponse error: %v", err)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != originalBody {
+		t.Errorf("body = %q, want %q (non-token endpoint should be unchanged)", string(body), originalBody)
+	}
+}
+
 // ---- test helpers ----
 
 func newTestTLSServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {

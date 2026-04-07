@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -163,9 +164,60 @@ func (m *OAuthRefreshMutator) MutateRequest(_ context.Context, req *http.Request
 	return nil
 }
 
-// MutateResponse is implemented in a later task.
-func (m *OAuthRefreshMutator) MutateResponse(_ context.Context, _ *http.Request, _ *http.Response) error {
-	return nil // placeholder
+// MutateResponse caches the real access token from the token endpoint
+// response and replaces it (and any rotated refresh token) with dummy
+// sentinel values before the response reaches the container.
+func (m *OAuthRefreshMutator) MutateResponse(_ context.Context, req *http.Request, resp *http.Response) error {
+	if !isTokenEndpoint(req) {
+		return nil
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return fmt.Errorf("read token response body: %w", err)
+	}
+
+	var tokenData map[string]any
+	if err := json.Unmarshal(bodyBytes, &tokenData); err != nil {
+		// Not valid JSON — pass through unchanged (might be an error response).
+		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		resp.ContentLength = int64(len(bodyBytes))
+		return nil
+	}
+
+	// Cache the real access token with expiry.
+	if accessToken, ok := tokenData["access_token"].(string); ok && accessToken != "" {
+		expiresIn := 3600.0 // default 1 hour
+		if ei, ok := tokenData["expires_in"].(float64); ok {
+			expiresIn = ei
+		}
+		expiry := time.Now().Add(time.Duration(expiresIn)*time.Second - 60*time.Second)
+
+		m.mu.Lock()
+		m.cachedToken = accessToken
+		m.cachedExpiry = expiry
+		m.mu.Unlock()
+
+		tokenData["access_token"] = DummyAccessToken
+	}
+
+	// Mask any rotated refresh token.
+	if _, ok := tokenData["refresh_token"]; ok {
+		tokenData["refresh_token"] = DummyRefreshToken
+	}
+
+	modified, err := json.Marshal(tokenData)
+	if err != nil {
+		return fmt.Errorf("marshal modified token response: %w", err)
+	}
+
+	resp.Body = io.NopCloser(bytes.NewReader(modified))
+	resp.ContentLength = int64(len(modified))
+	delete(resp.Header, "Transfer-Encoding")
+	resp.TransferEncoding = nil
+
+	return nil
 }
 
 // Rule maps a destination host to a credential mutator.

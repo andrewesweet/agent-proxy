@@ -161,6 +161,43 @@ func TestMultiDestinationMITM(t *testing.T) {
 	t.Logf("Service B: auth=%q body=%s", gotAuthB, respB)
 }
 
+func TestOAuthRefreshMutator_AccessToken_ColdStart(t *testing.T) {
+	m := NewOAuthRefreshMutator("real-refresh-token")
+	_, err := m.AccessToken()
+	if err == nil {
+		t.Fatal("expected error on cold start, got nil")
+	}
+}
+
+func TestOAuthRefreshMutator_AccessToken_Valid(t *testing.T) {
+	m := NewOAuthRefreshMutator("real-refresh-token")
+	m.mu.Lock()
+	m.cachedToken = "ya29.real-token"
+	m.cachedExpiry = time.Now().Add(30 * time.Minute)
+	m.mu.Unlock()
+
+	token, err := m.AccessToken()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if token != "ya29.real-token" {
+		t.Errorf("token = %q, want %q", token, "ya29.real-token")
+	}
+}
+
+func TestOAuthRefreshMutator_AccessToken_Expired(t *testing.T) {
+	m := NewOAuthRefreshMutator("real-refresh-token")
+	m.mu.Lock()
+	m.cachedToken = "ya29.expired-token"
+	m.cachedExpiry = time.Now().Add(-1 * time.Minute)
+	m.mu.Unlock()
+
+	_, err := m.AccessToken()
+	if err == nil {
+		t.Fatal("expected error for expired token, got nil")
+	}
+}
+
 // ---- test helpers ----
 
 func newTestTLSServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {

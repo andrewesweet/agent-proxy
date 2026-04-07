@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 )
 
 // CredentialMutator modifies HTTP requests and responses to inject credentials.
@@ -56,6 +58,64 @@ func StaticBearerMutator(token string) CredentialMutator {
 // which use "token" prefix instead of "Bearer".
 func StaticGitHubTokenMutator(token string) CredentialMutator {
 	return StaticTokenMutator("Authorization", "token "+token)
+}
+
+// TokenProvider returns the current access token for upstream API calls.
+type TokenProvider interface {
+	AccessToken() (string, error)
+}
+
+// DummyAccessToken is the sentinel access token returned to the container.
+// It is not a secret — its purpose is to keep real tokens out of container
+// memory and logs.
+const DummyAccessToken = "ya29.proxy-sentinel"
+
+// DummyRefreshToken is the sentinel refresh token substituted in token
+// endpoint responses when Google rotates the refresh token.
+const DummyRefreshToken = "1//proxy-sentinel-refresh"
+
+// OAuthRefreshMutator handles the oauth2.googleapis.com token endpoint.
+// It swaps dummy refresh tokens for real ones on requests, and caches
+// real access tokens from responses (returning dummies to the container).
+type OAuthRefreshMutator struct {
+	realRefreshToken string
+
+	mu           sync.RWMutex
+	cachedToken  string
+	cachedExpiry time.Time
+}
+
+// NewOAuthRefreshMutator creates a mutator for the OAuth token endpoint.
+// realRefreshToken is the host-side real refresh token that will be
+// substituted into token refresh requests.
+func NewOAuthRefreshMutator(realRefreshToken string) *OAuthRefreshMutator {
+	return &OAuthRefreshMutator{
+		realRefreshToken: realRefreshToken,
+	}
+}
+
+// AccessToken returns the cached real access token if it is still valid.
+// Returns an error if no token is cached or if the token has expired.
+func (m *OAuthRefreshMutator) AccessToken() (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.cachedToken == "" {
+		return "", fmt.Errorf("no access token cached (container must call token endpoint first)")
+	}
+	if time.Now().After(m.cachedExpiry) {
+		return "", fmt.Errorf("cached access token expired")
+	}
+	return m.cachedToken, nil
+}
+
+// MutateRequest is implemented in a later task.
+func (m *OAuthRefreshMutator) MutateRequest(_ context.Context, _ *http.Request) error {
+	return nil // placeholder
+}
+
+// MutateResponse is implemented in a later task.
+func (m *OAuthRefreshMutator) MutateResponse(_ context.Context, _ *http.Request, _ *http.Response) error {
+	return nil // placeholder
 }
 
 // Rule maps a destination host to a credential mutator.

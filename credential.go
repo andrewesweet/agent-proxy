@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -108,9 +111,56 @@ func (m *OAuthRefreshMutator) AccessToken() (string, error) {
 	return m.cachedToken, nil
 }
 
-// MutateRequest is implemented in a later task.
-func (m *OAuthRefreshMutator) MutateRequest(_ context.Context, _ *http.Request) error {
-	return nil // placeholder
+// isTokenEndpoint returns true if the request is a POST to a Google
+// OAuth token endpoint.
+func isTokenEndpoint(req *http.Request) bool {
+	if req.Method != http.MethodPost {
+		return false
+	}
+	p := req.URL.Path
+	return p == "/token" || p == "/oauth2/v4/token"
+}
+
+// MutateRequest swaps the dummy refresh_token for the real one in token
+// refresh requests. Non-refresh requests are passed through unchanged.
+func (m *OAuthRefreshMutator) MutateRequest(_ context.Context, req *http.Request) error {
+	if !isTokenEndpoint(req) {
+		return nil
+	}
+	if req.Body == nil {
+		return nil
+	}
+
+	bodyBytes, err := io.ReadAll(req.Body)
+	req.Body.Close()
+	if err != nil {
+		return fmt.Errorf("read token request body: %w", err)
+	}
+
+	vals, err := url.ParseQuery(string(bodyBytes))
+	if err != nil {
+		// Not a form body — pass through unchanged.
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		req.ContentLength = int64(len(bodyBytes))
+		return nil
+	}
+
+	if vals.Get("grant_type") != "refresh_token" {
+		// Not a refresh request — restore original body unchanged.
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		req.ContentLength = int64(len(bodyBytes))
+		return nil
+	}
+
+	vals.Set("refresh_token", m.realRefreshToken)
+	encoded := vals.Encode()
+	req.Body = io.NopCloser(strings.NewReader(encoded))
+	req.ContentLength = int64(len(encoded))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader(encoded)), nil
+	}
+
+	return nil
 }
 
 // MutateResponse is implemented in a later task.

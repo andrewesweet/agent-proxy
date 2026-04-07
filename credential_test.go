@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -195,6 +197,91 @@ func TestOAuthRefreshMutator_AccessToken_Expired(t *testing.T) {
 	_, err := m.AccessToken()
 	if err == nil {
 		t.Fatal("expected error for expired token, got nil")
+	}
+}
+
+func TestOAuthRefreshMutator_MutateRequest_SwapsToken(t *testing.T) {
+	m := NewOAuthRefreshMutator("real-refresh-token")
+	body := "grant_type=refresh_token&refresh_token=dummy-token&client_id=test"
+	req, _ := http.NewRequest("POST", "https://oauth2.googleapis.com/token", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	if err := m.MutateRequest(context.Background(), req); err != nil {
+		t.Fatalf("MutateRequest error: %v", err)
+	}
+
+	newBody, _ := io.ReadAll(req.Body)
+	vals, _ := url.ParseQuery(string(newBody))
+	if got := vals.Get("refresh_token"); got != "real-refresh-token" {
+		t.Errorf("refresh_token = %q, want %q", got, "real-refresh-token")
+	}
+	if got := vals.Get("grant_type"); got != "refresh_token" {
+		t.Errorf("grant_type = %q, want %q", got, "refresh_token")
+	}
+	if got := vals.Get("client_id"); got != "test" {
+		t.Errorf("client_id = %q, want %q", got, "test")
+	}
+	if req.ContentLength != int64(len(newBody)) {
+		t.Errorf("ContentLength = %d, want %d", req.ContentLength, int64(len(newBody)))
+	}
+}
+
+func TestOAuthRefreshMutator_MutateRequest_NonRefreshGrant(t *testing.T) {
+	m := NewOAuthRefreshMutator("real-refresh-token")
+	body := "grant_type=client_credentials&client_id=test"
+	req, _ := http.NewRequest("POST", "https://oauth2.googleapis.com/token", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	if err := m.MutateRequest(context.Background(), req); err != nil {
+		t.Fatalf("MutateRequest error: %v", err)
+	}
+
+	newBody, _ := io.ReadAll(req.Body)
+	if strings.Contains(string(newBody), "real-refresh-token") {
+		t.Error("non-refresh grant should not contain real refresh token")
+	}
+}
+
+func TestOAuthRefreshMutator_MutateRequest_WrongPath(t *testing.T) {
+	m := NewOAuthRefreshMutator("real-refresh-token")
+	body := "grant_type=refresh_token&refresh_token=dummy"
+	req, _ := http.NewRequest("POST", "https://oauth2.googleapis.com/revoke", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	if err := m.MutateRequest(context.Background(), req); err != nil {
+		t.Fatalf("MutateRequest error: %v", err)
+	}
+
+	newBody, _ := io.ReadAll(req.Body)
+	if strings.Contains(string(newBody), "real-refresh-token") {
+		t.Error("wrong path should not contain real refresh token")
+	}
+}
+
+func TestOAuthRefreshMutator_MutateRequest_GetMethod(t *testing.T) {
+	m := NewOAuthRefreshMutator("real-refresh-token")
+	req, _ := http.NewRequest("GET", "https://oauth2.googleapis.com/token", nil)
+
+	if err := m.MutateRequest(context.Background(), req); err != nil {
+		t.Fatalf("MutateRequest error: %v", err)
+	}
+	// No panic, no error — GET is a no-op.
+}
+
+func TestOAuthRefreshMutator_MutateRequest_V4Path(t *testing.T) {
+	m := NewOAuthRefreshMutator("real-refresh-token")
+	body := "grant_type=refresh_token&refresh_token=dummy-token"
+	req, _ := http.NewRequest("POST", "https://oauth2.googleapis.com/oauth2/v4/token", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	if err := m.MutateRequest(context.Background(), req); err != nil {
+		t.Fatalf("MutateRequest error: %v", err)
+	}
+
+	newBody, _ := io.ReadAll(req.Body)
+	vals, _ := url.ParseQuery(string(newBody))
+	if got := vals.Get("refresh_token"); got != "real-refresh-token" {
+		t.Errorf("refresh_token = %q, want %q", got, "real-refresh-token")
 	}
 }
 

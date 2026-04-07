@@ -242,7 +242,22 @@ func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *ht
 		// Inject credential via the mutator.
 		if err := mutator.MutateRequest(context.Background(), req); err != nil {
 			slog.Error("credential injection failed", "host", destHost, "error", err)
-			return
+			// E1: write 502 instead of bare connection teardown.
+			errResp := &http.Response{
+				StatusCode:    http.StatusBadGateway,
+				Status:        "502 Bad Gateway",
+				Proto:         "HTTP/1.1",
+				ProtoMajor:    1,
+				ProtoMinor:    1,
+				Header:        http.Header{"Content-Length": {"0"}},
+				Body:          io.NopCloser(strings.NewReader("")),
+				ContentLength: 0,
+			}
+			errResp.Write(tlsConn)
+			if req.Close {
+				return
+			}
+			continue
 		}
 		slog.Debug("credential_injected",
 			"host", destHost,

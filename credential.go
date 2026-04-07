@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -82,11 +84,12 @@ const DummyRefreshToken = "1//proxy-sentinel-refresh"
 // It swaps dummy refresh tokens for real ones on requests, and caches
 // real access tokens from responses (returning dummies to the container).
 type OAuthRefreshMutator struct {
+	// mu protects all mutable fields below: cachedToken, cachedExpiry,
+	// and realRefreshToken (which may be updated on token rotation).
+	mu               sync.RWMutex
 	realRefreshToken string
-
-	mu           sync.RWMutex
-	cachedToken  string
-	cachedExpiry time.Time
+	cachedToken      string
+	cachedExpiry     time.Time
 }
 
 // NewOAuthRefreshMutator creates a mutator for the OAuth token endpoint.
@@ -153,7 +156,10 @@ func (m *OAuthRefreshMutator) MutateRequest(_ context.Context, req *http.Request
 		return nil
 	}
 
-	vals.Set("refresh_token", m.realRefreshToken)
+	m.mu.RLock()
+	realToken := m.realRefreshToken
+	m.mu.RUnlock()
+	vals.Set("refresh_token", realToken)
 	encoded := vals.Encode()
 	req.Body = io.NopCloser(strings.NewReader(encoded))
 	req.ContentLength = int64(len(encoded))
@@ -172,44 +178,86 @@ func (m *OAuthRefreshMutator) MutateResponse(_ context.Context, req *http.Reques
 		return nil
 	}
 
+	// S3: only process successful token responses.
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+
 	bodyBytes, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if err != nil {
 		return fmt.Errorf("read token response body: %w", err)
 	}
 
+	// C1: decompress gzip-encoded responses before parsing.
+	if ce := resp.Header.Get("Content-Encoding"); ce == "gzip" {
+		gr, err := gzip.NewReader(bytes.NewReader(bodyBytes))
+		if err != nil {
+			return fmt.Errorf("decompress token response: %w", err)
+		}
+		bodyBytes, err = io.ReadAll(gr)
+		gr.Close()
+		if err != nil {
+			return fmt.Errorf("read decompressed token response: %w", err)
+		}
+		resp.Header.Del("Content-Encoding")
+	}
+
 	var tokenData map[string]any
 	if err := json.Unmarshal(bodyBytes, &tokenData); err != nil {
-		// Not valid JSON — pass through unchanged (might be an error response).
+		// E2: log when token endpoint returns non-JSON.
+		slog.Warn("token endpoint returned non-JSON response",
+			"content_type", resp.Header.Get("Content-Type"),
+			"body_len", len(bodyBytes),
+		)
 		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		resp.ContentLength = int64(len(bodyBytes))
 		return nil
 	}
 
-	// Cache the real access token with expiry.
-	if accessToken, ok := tokenData["access_token"].(string); ok && accessToken != "" {
+	// Extract the real access token and compute expiry — but don't commit
+	// to the cache until after json.Marshal succeeds (S1).
+	var accessToken string
+	var expiry time.Time
+	if at, ok := tokenData["access_token"].(string); ok && at != "" {
+		accessToken = at
 		expiresIn := 3600.0 // default 1 hour
 		if ei, ok := tokenData["expires_in"].(float64); ok {
 			expiresIn = ei
 		}
-		expiry := time.Now().Add(time.Duration(expiresIn)*time.Second - 60*time.Second)
-
-		m.mu.Lock()
-		m.cachedToken = accessToken
-		m.cachedExpiry = expiry
-		m.mu.Unlock()
+		// S4: clamp skew for small expires_in values.
+		ttl := time.Duration(expiresIn) * time.Second
+		skew := 60 * time.Second
+		if ttl < skew*2 {
+			skew = ttl / 2
+		}
+		expiry = time.Now().Add(ttl - skew)
 
 		tokenData["access_token"] = DummyAccessToken
 	}
 
-	// Mask any rotated refresh token.
-	if _, ok := tokenData["refresh_token"]; ok {
+	// S2: capture and update rotated refresh token.
+	var rotatedRefreshToken string
+	if rt, ok := tokenData["refresh_token"].(string); ok {
+		rotatedRefreshToken = rt
 		tokenData["refresh_token"] = DummyRefreshToken
 	}
 
 	modified, err := json.Marshal(tokenData)
 	if err != nil {
 		return fmt.Errorf("marshal modified token response: %w", err)
+	}
+
+	// S1: only commit cache after serialisation succeeds.
+	if accessToken != "" {
+		m.mu.Lock()
+		m.cachedToken = accessToken
+		m.cachedExpiry = expiry
+		// S2: update real refresh token if Google rotated it.
+		if rotatedRefreshToken != "" {
+			m.realRefreshToken = rotatedRefreshToken
+		}
+		m.mu.Unlock()
 	}
 
 	resp.Body = io.NopCloser(bytes.NewReader(modified))

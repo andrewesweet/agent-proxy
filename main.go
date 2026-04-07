@@ -285,6 +285,27 @@ func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *ht
 			"path", req.URL.Path,
 		)
 
+		// Invoke response mutation (e.g., OAuth token caching/replacement).
+		if err := mutator.MutateResponse(context.Background(), req, resp); err != nil {
+			slog.Error("response mutation failed", "host", destHost, "error", err)
+			resp.Body.Close()
+			errResp := &http.Response{
+				StatusCode:    http.StatusBadGateway,
+				Status:        "502 Bad Gateway",
+				Proto:         "HTTP/1.1",
+				ProtoMajor:    1,
+				ProtoMinor:    1,
+				Header:        http.Header{"Content-Length": {"0"}},
+				Body:          io.NopCloser(strings.NewReader("")),
+				ContentLength: 0,
+			}
+			errResp.Write(tlsConn)
+			if req.Close {
+				return
+			}
+			continue
+		}
+
 		// C2: set resp.Request so resp.Write knows the method (HEAD
 		// responses must not write a body).
 		resp.Request = req

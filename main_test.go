@@ -15,6 +15,88 @@ import (
 	"time"
 )
 
+// testMutator is a test helper implementing CredentialMutator with
+// configurable callbacks.
+type testMutator struct {
+	onRequest  func(context.Context, *http.Request) error
+	onResponse func(context.Context, *http.Request, *http.Response) error
+}
+
+func (m *testMutator) MutateRequest(ctx context.Context, req *http.Request) error {
+	if m.onRequest != nil {
+		return m.onRequest(ctx, req)
+	}
+	return nil
+}
+
+func (m *testMutator) MutateResponse(ctx context.Context, req *http.Request, resp *http.Response) error {
+	if m.onResponse != nil {
+		return m.onResponse(ctx, req, resp)
+	}
+	return nil
+}
+
+// TestMutateResponseCalled verifies that MutateResponse is called after
+// a successful upstream response and before writing to the client.
+func TestMutateResponseCalled(t *testing.T) {
+	var mutateResponseCalled bool
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"ok":true}`)
+	}))
+	defer upstream.Close()
+
+	ca, caKey, _ := generateEphemeralCA()
+	cc := newCertCache(ca, caKey)
+	upstreamAddr := upstream.Listener.Addr().String()
+
+	mutator := &testMutator{
+		onRequest: func(_ context.Context, req *http.Request) error {
+			req.Header.Set("Authorization", "Bearer test")
+			return nil
+		},
+		onResponse: func(_ context.Context, _ *http.Request, _ *http.Response) error {
+			mutateResponseCalled = true
+			return nil
+		},
+	}
+
+	p := &proxy{
+		transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if h, _, _ := net.SplitHostPort(addr); h == "test.example.com" {
+					addr = upstreamAddr
+				}
+				return net.DialTimeout(network, addr, 5*time.Second)
+			},
+		},
+		rules:     NewRuleSet(Rule{Host: "test.example.com", Mutator: mutator}),
+		certCache: cc,
+	}
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go p.handleConn(conn)
+		}
+	}()
+
+	proxyCA := x509.NewCertPool()
+	proxyCA.AddCert(ca)
+	doProxyRequest(t, ln.Addr().String(), "test.example.com", proxyCA)
+
+	if !mutateResponseCalled {
+		t.Error("MutateResponse was not called")
+	}
+}
+
 // TestMITMInjection verifies the core MITM hot path:
 //  1. Client sends CONNECT to proxy targeting the destination host
 //  2. Proxy terminates TLS using a generated cert signed by the test CA

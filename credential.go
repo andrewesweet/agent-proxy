@@ -1,16 +1,35 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
 )
 
-// CredentialMutator modifies an HTTP request to inject credentials.
-// It receives the full request so it can inspect method, path, and headers
-// to decide what to inject (supporting multi-header auth like AWS SigV4,
-// or body-based auth like OAuth token refresh).
-type CredentialMutator func(req *http.Request) error
+// CredentialMutator modifies HTTP requests and responses to inject credentials.
+// MutateRequest is called before forwarding to upstream.
+// MutateResponse is called after a successful upstream response, before
+// writing to the client. It is NOT called when RoundTrip returns an error.
+type CredentialMutator interface {
+	MutateRequest(ctx context.Context, req *http.Request) error
+	MutateResponse(ctx context.Context, req *http.Request, resp *http.Response) error
+}
+
+// staticTokenMutator sets a fixed header value on every request.
+type staticTokenMutator struct {
+	headerName  string
+	headerValue string
+}
+
+func (m *staticTokenMutator) MutateRequest(_ context.Context, req *http.Request) error {
+	req.Header.Set(m.headerName, m.headerValue)
+	return nil
+}
+
+func (m *staticTokenMutator) MutateResponse(_ context.Context, _ *http.Request, _ *http.Response) error {
+	return nil
+}
 
 // StaticTokenMutator returns a CredentialMutator that sets a fixed header
 // value on every request. Suitable for PATs, API keys, and registry tokens.
@@ -25,10 +44,7 @@ func StaticTokenMutator(headerName, headerValue string) CredentialMutator {
 			panic(fmt.Sprintf("invalid character %q in header name %q", c, headerName))
 		}
 	}
-	return func(req *http.Request) error {
-		req.Header.Set(headerName, headerValue)
-		return nil
-	}
+	return &staticTokenMutator{headerName: headerName, headerValue: headerValue}
 }
 
 // StaticBearerMutator is a convenience wrapper for Authorization: Bearer tokens.

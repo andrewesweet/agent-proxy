@@ -240,7 +240,7 @@ func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *ht
 		}
 
 		// Inject credential via the mutator.
-		if err := mutator(req); err != nil {
+		if err := mutator.MutateRequest(context.Background(), req); err != nil {
 			slog.Error("credential injection failed", "host", destHost, "error", err)
 			return
 		}

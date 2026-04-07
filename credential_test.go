@@ -14,11 +14,12 @@ import (
 	"time"
 )
 
+
 func TestStaticTokenMutator(t *testing.T) {
 	m := StaticTokenMutator("X-API-Key", "sk-test-123")
 	req, _ := http.NewRequest("GET", "https://example.com/api", nil)
 
-	if err := m(req); err != nil {
+	if err := m.MutateRequest(context.Background(), req); err != nil {
 		t.Fatalf("mutator error: %v", err)
 	}
 	if got := req.Header.Get("X-API-Key"); got != "sk-test-123" {
@@ -30,7 +31,7 @@ func TestStaticBearerMutator(t *testing.T) {
 	m := StaticBearerMutator("ya29.fake-token")
 	req, _ := http.NewRequest("GET", "https://example.com/api", nil)
 
-	m(req)
+	m.MutateRequest(context.Background(), req)
 	if got := req.Header.Get("Authorization"); got != "Bearer ya29.fake-token" {
 		t.Errorf("header = %q, want %q", got, "Bearer ya29.fake-token")
 	}
@@ -40,7 +41,7 @@ func TestStaticGitHubTokenMutator(t *testing.T) {
 	m := StaticGitHubTokenMutator("ghp_xxxx")
 	req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
 
-	m(req)
+	m.MutateRequest(context.Background(), req)
 	if got := req.Header.Get("Authorization"); got != "token ghp_xxxx" {
 		t.Errorf("header = %q, want %q", got, "token ghp_xxxx")
 	}

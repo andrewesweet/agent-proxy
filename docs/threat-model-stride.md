@@ -1,0 +1,294 @@
+# STRIDE Threat Model: agent-proxy
+
+**Date:** 2026-04-06
+**Status:** Initial formal STRIDE analysis
+**Scope:** MITM credential injection proxy for containerized AI coding agents
+**Framework:** Microsoft STRIDE (Spoofing, Tampering, Repudiation, Information Disclosure, Denial of Service, Elevation of Privilege)
+
+---
+
+## 1. System Overview and Data Flow Diagram
+
+agent-proxy is a Linux host process that intercepts outbound HTTPS from Podman
+containers, performs TLS MITM inspection on allowlisted destinations, substitutes
+real credentials for dummy sentinel tokens, and forwards to real upstream API
+servers. Containers hold only sentinel values; real credentials never enter
+container memory or filesystem.
+
+### Components and Trust Levels
+
+| Component | Trust Level | Notes |
+|-----------|-------------|-------|
+| AI agent container | **Untrusted** | May be prompt-injected or otherwise compromised |
+| agent-proxy process (host) | **Trusted** | Runs as dedicated `agent-proxy` user with systemd hardening |
+| Host filesystem (credentials, CA keys) | **Trusted** | Readable only by proxy user |
+| Upstream API servers (GitHub, GCP, npm) | **Conditionally trusted** | Trusted to respond authentically; not trusted to be reachable |
+| Sibling containers | **Untrusted** | Isolated by per-container Unix sockets (Phase 3d) |
+
+### Data Flow
+
+```
+[Container]
+    │  CONNECT api.github.com:443  (sentinel token in env/ADC)
+    │  via nftables redirect (port 443 → proxy, Phase 3e)
+    ▼
+[Trust Boundary A: Container → Proxy]
+    │
+[agent-proxy]
+    │  ① Validates CONNECT authority == SNI == Host header
+    │  ② Matches host against allowlist rules
+    │  ③ Terminates TLS with generated cert (host CA trusted by container)
+    │  ④ Reads plaintext request; strips sentinel Authorization header
+    │  ⑤ Fetches/caches real credential from host credential store
+    │  ⑥ Injects real Authorization header into request
+    │  ⑦ Forwards to real upstream over new TLS connection
+    │
+[Trust Boundary B: Proxy → Upstream]
+    │
+[Upstream API Server]
+    │  Real response (200/401/etc)
+    ▼
+[agent-proxy]
+    │  ⑧ For OAuth token responses: replaces real access_token with sentinel
+    │  ⑨ Writes modified response back to container
+    ▼
+[Container]
+    Receives sentinel tokens only; real credentials never in this path
+```
+
+### Trust Boundaries
+
+- **Boundary A (Container → Proxy):** Container is fully untrusted. All input
+  from the container (CONNECT target, TLS SNI, HTTP Host header, request body)
+  must be treated as potentially adversarial.
+- **Boundary B (Proxy → Upstream):** Proxy presents real credentials. Upstream
+  is trusted to authenticate and respond correctly, but upstream responses flow
+  back through the proxy and could contain malicious content the agent processes.
+
+---
+
+## 2. STRIDE Analysis by Component
+
+### 2.1 AI Agent Container (Untrusted)
+
+| Boundary/Asset | Category | Threat | Impact | Mitigation | Status |
+|---|---|---|---|---|---|
+| Container → Proxy: CONNECT request | **Spoofing** | Container spoofs a legitimate CONNECT target (e.g., `api.github.com`) to obtain credentials intended for another destination | Credential injection to wrong host | Three-way agreement: CONNECT authority == SNI == Host header enforced in `handleMITM` (U1) | Mitigated |
+| Container → Proxy: CONNECT request | **Spoofing** | Container sends CONNECT to allowlisted host but suppresses SNI, hoping to bypass SNI check | SNI bypass; credential injection without SNI validation | Empty SNI is permitted (A4 — low impact since Host header check still runs) | Partially Mitigated |
+| Container → Proxy: identity | **Spoofing** | Container A guesses Container B's Unix socket session ID and connects to obtain B's credentials | Cross-container credential theft | Per-container sockets with cryptographically random session IDs; parent directory NOT bind-mounted (N2, T7) | Deferred to Phase 3d |
+| Container → Proxy: OAuth device flow | **Spoofing** | Container performs full OAuth device flow, obtaining a real token that lands in container memory (`auth.json`) | Container holds live credential | Option A (host-side pre-population with sentinel bind-mount) not yet chosen; device-flow isolation design deferred | Deferred to Phase 3c/3d |
+| Request body / headers | **Tampering** | Rogue agent crafts HTTP request smuggling payload (CL.TE or TE.CL) to inject a second request with altered path/method to upstream API (A5) | Unauthorized API operations (e.g., DELETE repo) — not credential exfiltration | Go's `http.ReadRequest` and `http.DefaultTransport` use the same parser, reducing CL.TE gaps; proxy unconditionally overwrites `Authorization` | Partially Mitigated |
+| Host header | **Tampering** | Agent sends `Host: different.host.com` inside a CONNECT tunnel established for `allowlisted.host.com` | Credential injected to wrong host or allowlist bypass | U1: Host header must equal CONNECT authority; mismatch returns 400 | Mitigated |
+| Audit log | **Repudiation** | Agent denies having made a specific API call; no request-level audit trail beyond proxy logs | Unable to prove agent performed destructive action | Proxy logs method and path per request (slog JSON); no request body hashing or tamper-evident log | Partially Mitigated — request body and full header audit not implemented |
+| Outbound traffic | **Information Disclosure** | Agent observes response headers (`X-OAuth-Scopes`, `X-RateLimit-*`) to fingerprint real credential scope and identity (A1) | Token scope/identity leak | None — upstream response headers forwarded verbatim | Unmitigated |
+| Timing | **Information Disclosure** | Agent measures response latency to determine whether a live real credential is cached in the proxy (A3) | Credential liveness inference | None — proxy does not obfuscate timing | Unmitigated |
+| DNS (outbound UDP 53) | **Information Disclosure** | Agent encodes session metadata or timing observations into DNS queries to attacker-controlled nameserver (T5) | Low-bandwidth covert exfiltration channel; cannot carry real tokens | None — DNS is not filtered or proxied | Unmitigated |
+| Allowlisted API endpoints | **Information Disclosure** | Agent uses proxy-injected real credential to exfiltrate container filesystem content via GitHub API (create gist, push to repo) (A10) | Data exfiltration through legitimate API operations | None at proxy layer — requires write-scope restriction on injected credentials at policy layer | Unmitigated (by design; policy-layer defense needed) |
+| CONNECT to wildcard host | **Information Disclosure** | Agent CONNECT to attacker-controlled subdomain under a wildcard rule (e.g., `evil.googleapis.com`); proxy injects real GCP credential (T9, A2) | Full credential exfiltration to attacker-controlled server | Depth-limited wildcards (U3, planned); optional IP range validation against Google netblocks (off by default) | Partially Mitigated |
+| DNS poisoning | **Information Disclosure** | Agent influences host-side DNS resolution to redirect `api.github.com` to attacker IP; proxy injects real PAT into request to attacker server (A2) | Full credential exfiltration | IP pinning at rule-load time (U3, optional, off by default); requires host netns separation | Partially Mitigated |
+| Connection flooding | **Denial of Service** | Agent opens thousands of concurrent CONNECT connections to exhaust proxy goroutine pool or file descriptors | Proxy unavailability | No connection-limit or rate-limit per container implemented | Unmitigated |
+| Cert cache exhaustion | **Denial of Service** | After wildcard rules ship (Phase 3d), agent CONNECTs to thousands of unique subdomains to fill unbounded cert cache map (A9) | Proxy memory exhaustion | Currently limited (no wildcard rules); LRU eviction planned but not implemented | Deferred to Phase 3d |
+| JWKS endpoint observation | **Elevation of Privilege** | Agent observes `kid` in JWKS response substituted by proxy; if signing key is shared across containers, agent can forge id_tokens for sibling container identity (A8) | Cross-container identity impersonation | Per-session signing key (N1 design) but no documented `kid` rotation or per-container JWKS isolation | Partially Mitigated |
+| Capabilities inside container | **Elevation of Privilege** | Agent spawns child process that inherits network access and uses it to perform API calls the agent was not explicitly instructed to do | Unauthorized use of injected credentials | Container capability restrictions (Podman rootless defaults); no request-path restriction in proxy | Partially Mitigated |
+
+### 2.2 agent-proxy Process (Host)
+
+| Boundary/Asset | Category | Threat | Impact | Mitigation | Status |
+|---|---|---|---|---|---|
+| CA private key | **Spoofing** | Attacker reads ephemeral CA key from tmpfs (A7) and uses it to forge TLS certs for allowlisted hosts, enabling a second MITM inside the container | Cross-container MITM; not direct credential exfiltration (real creds still on host) | CA key written 0600 (proxy user only); key path not logged (S5); requires container escape or PID-namespace sharing as precondition | Partially Mitigated |
+| Proxy binary / config | **Spoofing** | Compromised host process replaces the proxy binary or its config to redirect credential injection | Complete credential compromise on all containers | Separate `agent-proxy` UID; `ProtectSystem=strict`; binary integrity not verified at runtime | Partially Mitigated |
+| Token cache (in-memory) | **Tampering** | N/A — proxy memory is not accessible from container without container escape | N/A | N/A | N/A — requires container escape as precondition |
+| Real token in transit (proxy→upstream) | **Tampering** | Attacker performs MITM on proxy-to-upstream connection by poisoning host DNS (A2) | Real credential sent to attacker-controlled server | Standard TLS verification by `http.DefaultTransport`; no certificate pinning | Partially Mitigated |
+| OAuthRefreshMutator | **Tampering** | Concurrent requests race on the shared `OAuthRefreshMutator` across multiple containers (A11); container receives wrong container's cached token | Cross-container credential confusion | Per-container socket identity (Phase 3d) will bind mutator instances per-container; current prototype shares state | Deferred to Phase 3d |
+| Proxy audit logs | **Repudiation** | Log entries for credential injections are not tamper-evident; a compromised host process could delete or alter them | Loss of forensic trail | JSON slog to stderr (systemd journal); no WORM or signed log | Unmitigated |
+| Proxy logs | **Information Disclosure** | Log statement accidentally emits a real token (e.g., Authorization header logged in debug mode) | Real credential in log files readable by log aggregation system | Invariant I6 enforced; logs emit sentinels not real tokens; code review confirmed no header logging | Mitigated |
+| Proxy process memory | **Information Disclosure** | Core dump or `/proc/<pid>/mem` read by root process exposes cached real tokens | Full credential exfiltration | `NoNewPrivileges=yes`; `PrivateTmp=true`; Podman rootless limits UID 0 mapping; core dump path restriction not documented | Partially Mitigated |
+| Proxy listen socket | **Denial of Service** | Non-container process on host connects to proxy listen socket and sends malformed CONNECT requests | Proxy goroutine exhaustion; log spam | TLS handshake timeout (30s, G1); panic recovery in `handleConn`; no IP allowlist on proxy listen socket | Partially Mitigated |
+| Token metadata endpoint (planned) | **Elevation of Privilege** | Rogue agent sends arbitrary blobs to `POST /sign` endpoint on per-container socket; proxy signs them with session JWT key; agent replays signatures in external services (T8) | Signature oracle abuse | Endpoint not yet implemented; design must restrict `aud` claim on signed blobs to allowlisted destinations | Deferred to Phase 3e |
+| nftables rules (planned) | **Elevation of Privilege** | Agent with `CAP_NET_ADMIN` (not default) modifies nftables rules in its own netns to bypass port-redirect enforcement | Proxy bypass; unauthenticated egress | Container runtime default drops `CAP_NET_ADMIN`; nftables redirect not yet implemented | Deferred to Phase 3e |
+
+### 2.3 Host Filesystem (Credentials and CA Keys)
+
+| Boundary/Asset | Category | Threat | Impact | Mitigation | Status |
+|---|---|---|---|---|---|
+| Credential files (refresh tokens, PATs) | **Spoofing** | N/A — files are static secrets read by proxy; no authentication protocol to spoof at this layer | N/A | N/A | N/A |
+| Credential files | **Tampering** | Compromised host process overwrites credential files with attacker-controlled values | Proxy injects attacker's credential on all subsequent requests | Separate proxy UID; `ProtectSystem=strict`; file permissions restrict write to proxy user or root | Partially Mitigated |
+| Credential files | **Repudiation** | N/A — credential files are not audit records | N/A | N/A | N/A |
+| Credential files | **Information Disclosure** | Container escape (T6) allows reading host filesystem; real credentials are exposed | Complete credential compromise | Podman rootless; systemd `PrivateTmp`; credentials readable only by `agent-proxy` user; kernel/runtime patching required | Partially Mitigated — residual risk is known limitation |
+| CA key on tmpfs | **Information Disclosure** | CA key readable if container gains access to host process filesystem (A7); enables cross-container MITM | Cross-container MITM (not direct credential exfiltration) | 0600 permissions; key path not logged; tmpfs location not predictable from inside container | Partially Mitigated |
+| Credential files | **Denial of Service** | Credential file deleted or corrupted; proxy cannot inject credentials | All authenticated API calls fail for affected container | Not mitigated; depends on operator backup/restore procedures | Unmitigated |
+| Credential files | **Elevation of Privilege** | N/A — credential files confer no additional privilege beyond what they represent | N/A | N/A | N/A |
+
+### 2.4 Upstream API Servers (External)
+
+| Boundary/Asset | Category | Threat | Impact | Mitigation | Status |
+|---|---|---|---|---|---|
+| Upstream TLS certificate | **Spoofing** | Attacker (via DNS poisoning) presents a valid-looking TLS certificate for the upstream host; proxy connects and injects real credential (A2) | Full credential exfiltration | Standard `http.DefaultTransport` TLS validation (system roots); no certificate pinning; U3 IP range pinning optional and off by default | Partially Mitigated |
+| Upstream response body | **Tampering** | Compromised upstream returns a crafted response body that causes the agent to take unintended actions (out of scope per threat model) | Agent misbehavior | Out of scope — proxy does not inspect response bodies for semantic safety | N/A (out of scope) |
+| Token endpoint response | **Tampering** | Compromised upstream returns a malicious `access_token` value (e.g., a token that grants additional scopes beyond what was requested) | Broader scope than expected; agent behavior affected | Proxy caches and sanitizes token endpoint responses (strips and replaces tokens); agent receives sentinel regardless of upstream value | Mitigated for token exfiltration; agent behavior affected by injected token scopes |
+| Upstream response | **Repudiation** | Upstream denies having responded to a request; no request ID correlation in proxy logs | N/A | N/A — upstream non-repudiation is outside agent-proxy's scope | N/A |
+| Upstream API rate limits | **Denial of Service** | Rogue agent issues flood of requests to allowlisted API (using proxy-injected credentials); upstream rate-limits or bans the real credential | Credential rate-limited or banned | No per-container rate limiting in proxy; agent can exhaust real credential's quota | Unmitigated |
+| Upstream | **Information Disclosure** | N/A — proxy does not disclose credentials to upstream beyond what is required for authentication | N/A | N/A | N/A |
+| Upstream response headers | **Elevation of Privilege** | Upstream returns headers (e.g., `Set-Cookie`, `X-OAuth-Scopes`) that reveal real account identity or session information usable for lateral movement | Identity fingerprinting (A1) | None — proxy forwards response headers verbatim | Unmitigated |
+
+### 2.5 Multi-Container / Sibling Container Boundary
+
+| Boundary/Asset | Category | Threat | Impact | Mitigation | Status |
+|---|---|---|---|---|---|
+| Shared CA certificate | **Spoofing** | Container with stolen CA key (A7) uses it to forge TLS certs and MITM sibling container's outbound traffic (A13) | Sibling container traffic inspection; credential observation | Per-session CA with 8h TTL (N6); 0600 key permissions; requires A7 precondition | Partially Mitigated |
+| Shared OAuthRefreshMutator | **Spoofing** | In current multi-container prototype, Container B's token endpoint call updates the shared mutator; Container A's next API call uses B's real token | Cross-container credential confusion (A11) | Per-container `OAuthRefreshMutator` instances (Phase 3d) | Deferred to Phase 3d |
+| JWKS substitution | **Spoofing** | Agent observes proxy's `kid` in JWKS response and crafts a fake id_token for sibling container's identity (A8) | Cross-container identity impersonation | No per-container `kid` rotation documented | Partially Mitigated |
+| Per-container socket paths | **Tampering** | Agent in Container A writes to Container B's Unix socket path if parent directory is bind-mounted (T7) | Unauthorized credential requests from Container A using Container B's identity | Individual socket files bind-mounted (not parent directory); cryptographically random session IDs | Deferred to Phase 3d |
+| Shared proxy state | **Denial of Service** | Cert cache exhaustion (A9) from one container affects all containers sharing the proxy process | Proxy DoS affecting all tenants | No LRU eviction; no per-container resource quotas | Unmitigated |
+| Cross-container data | **Information Disclosure** | Agent in Container A observes timing patterns correlated with Container B's API activity | Tenant activity inference | None — no timing isolation between containers | Unmitigated |
+| Shared proxy process | **Elevation of Privilege** | Agent exploits shared state in proxy (e.g., concurrent mutator race) to gain credentials of a higher-privileged sibling container | Privilege escalation across containers | Per-container socket design (Phase 3d) will isolate mutator state; not yet implemented | Deferred to Phase 3d |
+
+---
+
+## 3. Priority Matrix
+
+### 3.1 STRIDE Findings Cross-Referenced with Existing Threat Models
+
+| STRIDE Finding | Existing Coverage | Notes |
+|---|---|---|
+| Spoofing — CONNECT/SNI/Host mismatch | T2 (threat-model.md), A4 (red-team) | Well-mitigated; U1 enforced in code |
+| Spoofing — socket path guessing (cross-container) | T7 (threat-model.md) | Phase 3d deferred; design sound |
+| Spoofing — DNS poisoning to redirect credential injection | A2 (red-team) | High impact; optional mitigation not yet enabled |
+| Tampering — HTTP request smuggling | A5 (red-team) | Low credential-exfiltration impact; API abuse possible |
+| Tampering — shared OAuthRefreshMutator race | A11 (red-team), T3 (threat-model.md) | Phase 3d deferred; current prototype risk |
+| Repudiation — no tamper-evident audit log | Not in existing models | **New finding** — identified by STRIDE |
+| Repudiation — no request-body audit trail | Not in existing models | **New finding** — identified by STRIDE |
+| Information Disclosure — response header leakage (scope/identity) | A1 (red-team) | Unmitigated by design; feasible right now |
+| Information Disclosure — timing side-channel (credential liveness) | A3 (red-team) | Unmitigated; low severity |
+| Information Disclosure — DNS exfiltration | T5 (threat-model.md) | Unmitigated; non-credential metadata only |
+| Information Disclosure — API data exfiltration via legitimate calls | A10 (red-team) | Unmitigated by design; policy-layer fix needed |
+| Information Disclosure — wildcard rule DNS rebinding | T9 (threat-model.md), A2 (red-team) | Partially mitigated; IP pinning off by default |
+| Information Disclosure — credential rate limit exhaustion | Not in existing models | **New finding** — identified by STRIDE |
+| Information Disclosure — core dump / proc/mem | Not in existing models | **New finding** — partially mitigated |
+| Denial of Service — connection flooding | Not in existing models | **New finding** — unmitigated |
+| Denial of Service — cert cache exhaustion | A9 (red-team) | Phase 3d deferred |
+| Denial of Service — credential file deletion | Not in existing models | **New finding** — unmitigated |
+| Denial of Service — upstream rate-limit exhaustion | Not in existing models | **New finding** — unmitigated |
+| Elevation of Privilege — container escape to host credential store | T6 (threat-model.md) | Known limitation; defense-in-depth applied |
+| Elevation of Privilege — sign endpoint signature oracle | T8 (threat-model.md) | Phase 3e deferred; endpoint not yet implemented |
+| Elevation of Privilege — JWKS kid observation + id_token forgery | A8 (red-team) | Partially mitigated; no `kid` rotation documented |
+| Elevation of Privilege — CA key theft enabling cross-container MITM | A7, A13 (red-team) | Partially mitigated; requires container escape precondition |
+
+### 3.2 New Threats Surfaced by STRIDE Not in Either Existing Model
+
+1. **Repudiation — no tamper-evident audit log:** The proxy logs method and path
+   per request but does not produce tamper-evident, append-only records. A
+   compromised host process can delete or alter log entries. An agent that
+   performs destructive API operations (via A10) cannot be definitively attributed.
+
+2. **Repudiation — no request-body audit trail:** The proxy logs that a request
+   was forwarded but does not hash or record the request body. For write operations
+   (POST, PUT, PATCH, DELETE), there is no forensic record of what was sent.
+
+3. **DoS — connection flooding from container:** The proxy accepts unlimited
+   concurrent connections from the container. A rogue agent can open thousands
+   of CONNECT connections to exhaust proxy goroutines or file descriptors,
+   affecting all containers sharing the proxy process.
+
+4. **DoS — upstream rate-limit exhaustion:** A rogue agent can issue a flood
+   of valid API requests (which the proxy dutifully authenticates) to exhaust
+   the real credential's API rate limit or trigger account suspension.
+
+5. **DoS — credential file deletion:** If a host process with write access to
+   the credential store deletes or corrupts a credential file, the proxy fails
+   open (returning 502) but provides no alerting or fallback.
+
+6. **Information Disclosure — core dump / `/proc/<pid>/mem`:** The proxy caches
+   real access tokens in-memory. A root process on the host (or a container
+   escape) can read `/proc/<proxy-pid>/mem` or trigger a core dump to exfiltrate
+   cached real tokens. This is distinct from T6 (filesystem credential read).
+
+---
+
+## 4. Top 5 Priority Recommendations
+
+### P1 — Enable IP Pinning for Wildcard Rules (Addresses: T9, A2, STRIDE-Spoofing-DNS)
+
+**Current state:** U3 IP range validation is optional and off by default. A single
+rogue DNS query can redirect an allowlisted hostname to an attacker-controlled IP,
+causing the proxy to inject real credentials into an attacker's TLS endpoint.
+
+**Recommendation:** Promote IP range pinning from opt-in to **mandatory for any
+rule that carries a write-capable credential**. At rule-load time, resolve the
+destination hostname and record the IP. On each connection, re-resolve and compare.
+If the IP has changed, fail closed (reject the connection with a log entry) rather
+than forwarding to the new IP. For wildcard rules, validate against published IP
+ranges (e.g., Google's netblock TXT records). This converts the DNS poisoning
+attack from feasible-with-difficult-preconditions to infeasible.
+
+### P2 — Implement Per-Container Credential Isolation (Phase 3d) (Addresses: A11, T7, STRIDE-Tampering-Shared-State)
+
+**Current state:** Multiple containers sharing the proxy process share a single
+`OAuthRefreshMutator` instance. Container B's token endpoint call updates the
+shared state; Container A's next request injects B's cached real token.
+
+**Recommendation:** Accelerate Phase 3d: bind one `OAuthRefreshMutator` instance
+per per-container Unix socket listener. When the socket goroutine is created by
+`agent-run`, it is given its own mutator initialized with that container's
+credential. No cross-container state sharing. This also eliminates T7 (socket
+path guessing) and provides the identity anchor for per-container audit logs.
+
+### P3 — Add Connection Rate Limiting per Container (Addresses: STRIDE-DoS-Connection-Flooding, A9)
+
+**Current state:** The proxy accepts unlimited CONNECT connections. A rogue agent
+can exhaust goroutines or file descriptors, causing proxy unavailability for all
+containers.
+
+**Recommendation:** Implement a per-socket (per-container) connection semaphore
+with a configurable maximum (e.g., 64 concurrent connections per container). Add
+a configurable request rate limit (e.g., 100 req/s per container) enforced in
+`handleMITM`. This also bounds the cert cache growth rate (A9) until LRU eviction
+ships. Connection limits should be logged at WARN when hit.
+
+### P4 — Implement Tamper-Evident Request Audit Log (Addresses: STRIDE-Repudiation, A10)
+
+**Current state:** The proxy logs method and path per forwarded request, but logs
+are not tamper-evident and request bodies are not recorded. An agent that exfiltrates
+data via legitimate API writes (A10) leaves no forensic trace beyond the proxy's
+deletable JSON logs.
+
+**Recommendation:** Add a structured audit log stream (distinct from the debug log)
+that records per-request: timestamp, container session ID, method, host, path,
+response status code, request body SHA-256 hash (not the body itself), and response
+body length. Write this log to a file opened with `O_APPEND` under the proxy user's
+home; route it to the systemd journal. For production deployments, forward to an
+external SIEM. This does not prevent A10 but provides forensic evidence for
+incident response.
+
+### P5 — Restrict the Proxy CA to Allowlisted Hostnames (Invariant I4) (Addresses: A7, A13, STRIDE-Spoofing-CA-Key-Theft)
+
+**Current state:** The proxy CA can sign leaf certificates for any hostname
+(Invariant I4 violation documented in Phase 3a). A stolen CA key enables MITM
+on any HTTPS server the container trusts, not just allowlisted destinations.
+
+**Recommendation:** Implement a `NameConstraints` extension in the CA certificate
+restricting permitted DNS names to the set of allowlisted hostnames (or their
+parent domains). This is a standard X.509 extension (`x509.Certificate.PermittedDNSDomains`
+in Go). A stolen CA key can then only sign certs for allowlisted destinations —
+significantly limiting the impact of A7 and A13. This is a Phase 3d prerequisite
+that should be implemented alongside per-container socket identity.
+
+---
+
+## 5. Invariant Gaps Highlighted by STRIDE
+
+The following security invariants (from threat-model.md §6) have gaps exposed or
+confirmed by this analysis:
+
+| Invariant | STRIDE Category | Gap |
+|-----------|-----------------|-----|
+| I4 — CA signs only allowlisted hosts | Spoofing | CA can sign any hostname; NameConstraints not set |
+| I5 — Per-container identity unforgeable | Spoofing, Elevation of Privilege | Per-container sockets not yet implemented (Phase 3d) |
+| I7 — Allowlist bypass not possible | Information Disclosure | DNS poisoning can redirect allowlisted hostname to attacker IP; IP pinning optional and off |
+| (new) — No tamper-evident audit trail | Repudiation | No WORM or signed audit log; request bodies not hashed |
+| (new) — No per-container resource quotas | Denial of Service | No connection limits or request rate limits per container |
+
+---
+
+*Cross-references: T1–T9 from threat-model.md, A1–A13 from threat-model-red-team.md,
+U1–U3 and N1–N10 from design-decisions.md.*

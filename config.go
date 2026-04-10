@@ -208,6 +208,15 @@ func buildRuleSet(cfg *Config) (*RuleSet, error) {
 		})
 	}
 
+	// A17: zero credential-reference fields on RuleConfig so they
+	// cannot be accidentally emitted via debug logging.
+	for i := range cfg.Rules {
+		cfg.Rules[i].TokenFile = ""
+		cfg.Rules[i].TokenEnv = ""
+		cfg.Rules[i].RefreshTokenFile = ""
+		cfg.Rules[i].RefreshTokenEnv = ""
+	}
+
 	return NewRuleSet(built...), nil
 }
 

@@ -421,3 +421,40 @@ rules:
 		t.Errorf("Authorization = %q, want %q", got, "Bearer ghp_test")
 	}
 }
+
+func TestLoadConfig_CredentialNotRetainedInConfig(t *testing.T) {
+	secretPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(secretPath, []byte("ghp_secret"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com
+    type: static
+    token_file: `+secretPath+`
+  - host: oauth2.googleapis.com
+    type: oauth_refresh
+    refresh_token_env: GOOGLE_REFRESH
+`)
+	t.Setenv("GOOGLE_REFRESH", "1//real")
+
+	cfg, _, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	for i, rc := range cfg.Rules {
+		if rc.TokenFile != "" {
+			t.Errorf("rule %d: TokenFile = %q, want empty after zeroing", i, rc.TokenFile)
+		}
+		if rc.TokenEnv != "" {
+			t.Errorf("rule %d: TokenEnv = %q, want empty after zeroing", i, rc.TokenEnv)
+		}
+		if rc.RefreshTokenFile != "" {
+			t.Errorf("rule %d: RefreshTokenFile = %q, want empty after zeroing", i, rc.RefreshTokenFile)
+		}
+		if rc.RefreshTokenEnv != "" {
+			t.Errorf("rule %d: RefreshTokenEnv = %q, want empty after zeroing", i, rc.RefreshTokenEnv)
+		}
+	}
+}

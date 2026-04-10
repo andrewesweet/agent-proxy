@@ -239,6 +239,39 @@ func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *ht
 			return
 		}
 
+		// Enforce per-rule method allowlist (G2).
+		if len(rule.AllowMethods) > 0 {
+			allowed := false
+			for _, m := range rule.AllowMethods {
+				if m == req.Method {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				slog.Warn("method_blocked",
+					"host", destHost,
+					"method", req.Method,
+					"allow_methods", rule.AllowMethods,
+				)
+				resp := &http.Response{
+					StatusCode:    http.StatusMethodNotAllowed,
+					Status:        "405 Method Not Allowed",
+					Proto:         "HTTP/1.1",
+					ProtoMajor:    1,
+					ProtoMinor:    1,
+					Header:        http.Header{"Content-Length": {"0"}},
+					Body:          io.NopCloser(strings.NewReader("")),
+					ContentLength: 0,
+				}
+				resp.Write(tlsConn)
+				if req.Close {
+					return
+				}
+				continue
+			}
+		}
+
 		// Inject credential via the mutator.
 		if err := rule.Mutator.MutateRequest(context.Background(), req); err != nil {
 			slog.Error("credential injection failed", "host", destHost, "error", err)

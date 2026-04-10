@@ -422,6 +422,55 @@ rules:
 	}
 }
 
+func TestLoadConfig_AllowMethodsLowercase(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com
+    type: static
+    token_env: GH_TOKEN
+    allow_methods: [get, HEAD]
+`)
+	t.Setenv("GH_TOKEN", "ghp_test")
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "uppercase") {
+		t.Errorf("expected 'uppercase' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_AllowMethodsEmptyToken(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com
+    type: static
+    token_env: GH_TOKEN
+    allow_methods: ["", "GET"]
+`)
+	t.Setenv("GH_TOKEN", "ghp_test")
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "allow_methods") {
+		t.Errorf("expected 'allow_methods' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_AllowMethodsValid(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com
+    type: static
+    token_env: GH_TOKEN
+    allow_methods: [GET, HEAD, OPTIONS]
+`)
+	t.Setenv("GH_TOKEN", "ghp_test")
+	_, rules, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	r := rules.Match("api.github.com")
+	if len(r.AllowMethods) != 3 {
+		t.Errorf("AllowMethods = %v, want [GET HEAD OPTIONS]", r.AllowMethods)
+	}
+}
+
 func TestLoadConfig_CredentialNotRetainedInConfig(t *testing.T) {
 	secretPath := filepath.Join(t.TempDir(), "token")
 	if err := os.WriteFile(secretPath, []byte("ghp_secret"), 0o600); err != nil {

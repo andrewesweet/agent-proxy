@@ -128,6 +128,18 @@ func validate(cfg *Config) error {
 		default:
 			return fmt.Errorf("rule %d (%s): unknown type %q (want static, oauth_refresh, or oauth_bearer)", i, rc.Host, rc.Type)
 		}
+
+		// allow_methods validation: uppercase ASCII letters only.
+		for _, m := range rc.AllowMethods {
+			if m == "" {
+				return fmt.Errorf("rule %d (%s): allow_methods entry is empty", i, rc.Host)
+			}
+			for _, c := range m {
+				if c < 'A' || c > 'Z' {
+					return fmt.Errorf("rule %d (%s): allow_methods entry %q must be uppercase HTTP method token (A-Z only)", i, rc.Host, m)
+				}
+			}
+		}
 	}
 
 	// CA: both set or both empty.

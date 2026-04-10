@@ -482,6 +482,102 @@ func TestOAuthRefreshFlow(t *testing.T) {
 	t.Logf("OAuth flow verified: refresh_token swapped, access_token cached and injected")
 }
 
+// TestMethodBlockedByAllowMethods verifies that a request whose method
+// is not in the rule's AllowMethods is rejected with 405 and not
+// forwarded to upstream.
+func TestMethodBlockedByAllowMethods(t *testing.T) {
+	var upstreamHit bool
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit = true
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	ca, caKey, _ := generateEphemeralCA()
+	cc := newCertCache(ca, caKey)
+	upstreamAddr := upstream.Listener.Addr().String()
+
+	p := &proxy{
+		transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if h, _, _ := net.SplitHostPort(addr); h == "test.example.com" {
+					addr = upstreamAddr
+				}
+				return net.DialTimeout(network, addr, 5*time.Second)
+			},
+		},
+		rules: NewRuleSet(Rule{
+			Host:         "test.example.com",
+			Mutator:      StaticBearerMutator("test"),
+			AllowMethods: []string{"GET", "HEAD"},
+		}),
+		certCache: cc,
+	}
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go p.handleConn(conn)
+		}
+	}()
+
+	proxyCA := x509.NewCertPool()
+	proxyCA.AddCert(ca)
+
+	status := doProxyPostStatus(t, ln.Addr().String(), "test.example.com", "/api", "data=evil", proxyCA)
+	if status != 405 {
+		t.Errorf("status = %d, want 405", status)
+	}
+	if upstreamHit {
+		t.Error("upstream was hit despite POST not in AllowMethods")
+	}
+}
+
+// doProxyPostStatus sends a POST through the proxy and returns the
+// response status code.
+func doProxyPostStatus(t *testing.T, proxyAddr, destHost, path, body string, proxyCA *x509.CertPool) int {
+	t.Helper()
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+
+	fmt.Fprintf(conn, "CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n", destHost, destHost)
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("CONNECT failed: %v status=%d", err, resp.StatusCode)
+	}
+
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName: destHost,
+		RootCAs:    proxyCA,
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("tls: %v", err)
+	}
+	defer tlsConn.Close()
+
+	reqStr := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		path, destHost, len(body), body)
+	io.WriteString(tlsConn, reqStr)
+
+	innerResp, err := http.ReadResponse(bufio.NewReader(tlsConn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer innerResp.Body.Close()
+	return innerResp.StatusCode
+}
+
 // doProxyPost sends a POST request through the proxy and returns the response body.
 func doProxyPost(t *testing.T, proxyAddr, destHost, path, body string, proxyCA *x509.CertPool) string {
 	t.Helper()

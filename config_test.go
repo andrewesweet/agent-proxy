@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -218,5 +220,204 @@ rules:
 	_, _, err := LoadConfig(path)
 	if err == nil || !strings.Contains(err.Error(), "audit_log") {
 		t.Errorf("expected 'audit_log' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_StaticTokenFile(t *testing.T) {
+	secretPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(secretPath, []byte("  ghp_from_file  \n"), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com
+    type: static
+    token_file: `+secretPath+`
+`)
+	cfg, rules, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	_ = cfg
+	r := rules.Match("api.github.com")
+	if r == nil {
+		t.Fatal("no rule for api.github.com")
+	}
+	// Exercise the mutator: check the header is set with trimmed token.
+	req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
+	if err := r.Mutator.MutateRequest(context.Background(), req); err != nil {
+		t.Fatalf("MutateRequest: %v", err)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer ghp_from_file" {
+		t.Errorf("Authorization = %q, want %q", got, "Bearer ghp_from_file")
+	}
+}
+
+func TestLoadConfig_StaticBothTokenSources(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com
+    type: static
+    token_file: /some/path
+    token_env: GH_TOKEN
+`)
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "exactly one") {
+		t.Errorf("expected 'exactly one' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_StaticNoTokenSource(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com
+    type: static
+`)
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "token_file or token_env") {
+		t.Errorf("expected 'token_file or token_env' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_WhitespaceOnlyToken(t *testing.T) {
+	secretPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(secretPath, []byte("   \n\t  "), 0o600); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com
+    type: static
+    token_file: `+secretPath+`
+`)
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Errorf("expected 'empty' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_TokenEnvEmpty(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com
+    type: static
+    token_env: MISSING_VAR_XYZ
+`)
+	os.Unsetenv("MISSING_VAR_XYZ")
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Errorf("expected 'empty' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_OAuthRefresh(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: oauth2.googleapis.com
+    type: oauth_refresh
+    refresh_token_env: GOOGLE_REFRESH
+`)
+	t.Setenv("GOOGLE_REFRESH", "1//real-refresh-token")
+	_, rules, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	r := rules.Match("oauth2.googleapis.com")
+	if r == nil {
+		t.Fatal("no rule for oauth2.googleapis.com")
+	}
+	if _, ok := r.Mutator.(*OAuthRefreshMutator); !ok {
+		t.Errorf("mutator = %T, want *OAuthRefreshMutator", r.Mutator)
+	}
+}
+
+func TestLoadConfig_OAuthBearer(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: oauth2.googleapis.com
+    type: oauth_refresh
+    refresh_token_env: GOOGLE_REFRESH
+  - host: cloudresourcemanager.googleapis.com
+    type: oauth_bearer
+    token_source: oauth2.googleapis.com
+`)
+	t.Setenv("GOOGLE_REFRESH", "1//real")
+	_, rules, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	r := rules.Match("cloudresourcemanager.googleapis.com")
+	if r == nil {
+		t.Fatal("no rule for cloudresourcemanager.googleapis.com")
+	}
+	if _, ok := r.Mutator.(*OAuthBearerMutator); !ok {
+		t.Errorf("mutator = %T, want *OAuthBearerMutator", r.Mutator)
+	}
+}
+
+func TestLoadConfig_OAuthBearerMissingSource(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: cloudresourcemanager.googleapis.com
+    type: oauth_bearer
+    token_source: oauth2.googleapis.com
+`)
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "token_source") {
+		t.Errorf("expected 'token_source' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_OAuthBearerSourceNotRefresh(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com
+    type: static
+    token_env: GH_TOKEN
+  - host: other.example.com
+    type: oauth_bearer
+    token_source: api.github.com
+`)
+	t.Setenv("GH_TOKEN", "ghp_test")
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "oauth_refresh") {
+		t.Errorf("expected 'oauth_refresh' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_StaticInvalidHeader(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com
+    type: static
+    header: "Bad\nHeader"
+    token_env: GH_TOKEN
+`)
+	t.Setenv("GH_TOKEN", "ghp_test")
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "header") {
+		t.Errorf("expected 'header' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_StaticDefaults(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com
+    type: static
+    token_env: GH_TOKEN
+`)
+	t.Setenv("GH_TOKEN", "ghp_test")
+	_, rules, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	r := rules.Match("api.github.com")
+	req, _ := http.NewRequest("GET", "https://api.github.com/user", nil)
+	if err := r.Mutator.MutateRequest(context.Background(), req); err != nil {
+		t.Fatalf("MutateRequest: %v", err)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer ghp_test" {
+		t.Errorf("Authorization = %q, want %q", got, "Bearer ghp_test")
 	}
 }

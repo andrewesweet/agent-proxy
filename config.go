@@ -161,21 +161,112 @@ func validate(cfg *Config) error {
 	return nil
 }
 
-// buildRuleSet converts RuleConfig entries into Rule values wired to
-// constructed mutators. Full validation is added in later tasks.
+// buildRuleSet resolves credentials, constructs mutators, and assembles
+// a RuleSet.
 func buildRuleSet(cfg *Config) (*RuleSet, error) {
 	built := make([]Rule, 0, len(cfg.Rules))
+	// Track oauth_refresh mutators by lowercased host for oauth_bearer lookup.
+	refreshByHost := make(map[string]*OAuthRefreshMutator)
+
 	for i := range cfg.Rules {
 		rc := &cfg.Rules[i]
-		// Minimal build for Task 3 — just wire up a static mutator
-		// from token_env. Full logic comes in Task 6.
-		if rc.Type == "static" && rc.TokenEnv != "" {
-			val := os.Getenv(rc.TokenEnv)
-			built = append(built, Rule{
-				Host:    rc.Host,
-				Mutator: StaticBearerMutator(val),
-			})
+
+		var mutator CredentialMutator
+		switch rc.Type {
+		case "static":
+			m, err := buildStaticMutator(rc)
+			if err != nil {
+				return nil, err
+			}
+			mutator = m
+
+		case "oauth_refresh":
+			refreshToken, err := resolveCredential(rc.RefreshTokenFile, rc.RefreshTokenEnv, "refresh_token")
+			if err != nil {
+				return nil, fmt.Errorf("rule %d (%s): %w", i, rc.Host, err)
+			}
+			refresh := NewOAuthRefreshMutator(refreshToken)
+			refreshByHost[strings.ToLower(rc.Host)] = refresh
+			mutator = refresh
+
+		case "oauth_bearer":
+			if rc.TokenSource == "" {
+				return nil, fmt.Errorf("rule %d (%s): oauth_bearer requires token_source", i, rc.Host)
+			}
+			srcHost := strings.ToLower(rc.TokenSource)
+			refresh, ok := refreshByHost[srcHost]
+			if !ok {
+				return nil, fmt.Errorf("rule %d (%s): token_source %q does not reference a preceding oauth_refresh rule", i, rc.Host, rc.TokenSource)
+			}
+			mutator = NewOAuthBearerMutator(refresh)
+		}
+
+		built = append(built, Rule{
+			Host:         rc.Host,
+			Mutator:      mutator,
+			AllowMethods: rc.AllowMethods,
+		})
+	}
+
+	return NewRuleSet(built...), nil
+}
+
+// buildStaticMutator constructs a StaticTokenMutator from a RuleConfig,
+// applying defaults for header and prefix and validating the header.
+func buildStaticMutator(rc *RuleConfig) (CredentialMutator, error) {
+	token, err := resolveCredential(rc.TokenFile, rc.TokenEnv, "token")
+	if err != nil {
+		return nil, fmt.Errorf("rule (%s): %w", rc.Host, err)
+	}
+
+	header := rc.Header
+	if header == "" {
+		header = "Authorization"
+	}
+	// Validate header before calling StaticTokenMutator, which would panic.
+	for _, c := range header {
+		if c <= ' ' || c == ':' || c >= 0x7f {
+			return nil, fmt.Errorf("rule (%s): invalid character %q in header %q", rc.Host, c, header)
 		}
 	}
-	return NewRuleSet(built...), nil
+
+	prefix := rc.Prefix
+	if prefix == "" {
+		prefix = "Bearer "
+	}
+
+	return StaticTokenMutator(header, prefix+token), nil
+}
+
+// resolveCredential reads a credential value from either a file path
+// or an env var name. Exactly one of fileVal/envVal must be non-empty.
+// The result is trimmed of whitespace; an empty post-trim result is an
+// error.
+func resolveCredential(fileVal, envVal, fieldLabel string) (string, error) {
+	fileSet := fileVal != ""
+	envSet := envVal != ""
+
+	switch {
+	case fileSet && envSet:
+		return "", fmt.Errorf("%s: exactly one of _file or _env must be set (both provided)", fieldLabel)
+	case !fileSet && !envSet:
+		return "", fmt.Errorf("%s: exactly one of %s_file or %s_env required (neither provided)", fieldLabel, fieldLabel, fieldLabel)
+	}
+
+	var raw string
+	if fileSet {
+		data, err := os.ReadFile(fileVal)
+		if err != nil {
+			return "", fmt.Errorf("%s: read file %q: %w", fieldLabel, fileVal, err)
+		}
+		raw = string(data)
+	} else {
+		raw = os.Getenv(envVal)
+	}
+
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", fmt.Errorf("%s: resolved value is empty", fieldLabel)
+	}
+	return trimmed, nil
 }

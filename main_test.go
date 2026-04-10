@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -576,6 +578,126 @@ func doProxyPostStatus(t *testing.T, proxyAddr, destHost, path, body string, pro
 	}
 	defer innerResp.Body.Close()
 	return innerResp.StatusCode
+}
+
+// TestUnixSocketListen verifies the proxy can bind to a Unix socket
+// and accept CONNECT requests via that socket.
+func TestUnixSocketListen(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"ok":true}`)
+	}))
+	defer upstream.Close()
+
+	ca, caKey, _ := generateEphemeralCA()
+	cc := newCertCache(ca, caKey)
+	upstreamAddr := upstream.Listener.Addr().String()
+
+	p := &proxy{
+		transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if h, _, _ := net.SplitHostPort(addr); h == "test.example.com" {
+					addr = upstreamAddr
+				}
+				return net.DialTimeout(network, addr, 5*time.Second)
+			},
+		},
+		rules: NewRuleSet(Rule{
+			Host:    "test.example.com",
+			Mutator: StaticBearerMutator("test"),
+		}),
+		certCache: cc,
+	}
+
+	sockPath := filepath.Join(t.TempDir(), "proxy.sock")
+	ln, err := listen("unix://" + sockPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	info, err := os.Stat(sockPath)
+	if err != nil {
+		t.Fatalf("stat socket: %v", err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Errorf("socket mode = %o, want 0600", mode)
+	}
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go p.handleConn(conn)
+		}
+	}()
+
+	proxyCA := x509.NewCertPool()
+	proxyCA.AddCert(ca)
+
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("dial unix: %v", err)
+	}
+	defer conn.Close()
+
+	fmt.Fprintf(conn, "CONNECT test.example.com:443 HTTP/1.1\r\nHost: test.example.com:443\r\n\r\n")
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("CONNECT: err=%v status=%d", err, resp.StatusCode)
+	}
+
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName: "test.example.com",
+		RootCAs:    proxyCA,
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("tls: %v", err)
+	}
+	defer tlsConn.Close()
+
+	fmt.Fprintf(tlsConn, "GET / HTTP/1.1\r\nHost: test.example.com\r\nConnection: close\r\n\r\n")
+	innerResp, err := http.ReadResponse(bufio.NewReader(tlsConn), nil)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	defer innerResp.Body.Close()
+	if innerResp.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", innerResp.StatusCode)
+	}
+}
+
+func TestUnixSocketListen_StaleRemoved(t *testing.T) {
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "proxy.sock")
+
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("initial listen: %v", err)
+	}
+	ln.Close()
+
+	ln2, err := listen("unix://" + sockPath)
+	if err != nil {
+		t.Fatalf("listen on stale: %v", err)
+	}
+	defer ln2.Close()
+}
+
+func TestUnixSocketListen_ExistingNonSocketFile(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "proxy.sock")
+	if err := os.WriteFile(filePath, []byte("not a socket"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	_, err := listen("unix://" + filePath)
+	if err == nil {
+		t.Fatal("expected error for non-socket file at listen path")
+	}
 }
 
 // doProxyPost sends a POST request through the proxy and returns the response body.

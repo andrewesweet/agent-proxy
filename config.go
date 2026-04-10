@@ -96,6 +96,13 @@ func LoadConfig(path string) (*Config, *RuleSet, error) {
 		return nil, nil, err
 	}
 
+	if !strings.HasPrefix(cfg.Listen, "unix://") && cfg.ListenAllowTCP {
+		slog.Warn("listen address is TCP — any host process can reach the proxy",
+			"listen", cfg.Listen,
+			"note", "per-container Unix sockets (Phase 3d-4) will supersede this (STRIDE Trust Boundary C)",
+		)
+	}
+
 	// Build the RuleSet. Validation and credential resolution are in
 	// subsequent tasks — for now this is a minimal pass-through.
 	rules, err := buildRuleSet(&cfg)
@@ -128,6 +135,16 @@ func LoadConfig(path string) (*Config, *RuleSet, error) {
 // validate checks structural invariants of the parsed config. It does
 // not resolve credentials — that happens in buildRuleSet.
 func validate(cfg *Config) error {
+	// listen validation.
+	if strings.HasPrefix(cfg.Listen, "unix://") {
+		// Unix socket — always allowed.
+	} else {
+		// TCP — requires explicit opt-in.
+		if !cfg.ListenAllowTCP {
+			return fmt.Errorf("listen %q: TCP listen address requires listen_allow_tcp: true; prefer unix:// for production deployments (STRIDE Trust Boundary C)", cfg.Listen)
+		}
+	}
+
 	if len(cfg.Rules) == 0 {
 		return fmt.Errorf("config: at least one rule required")
 	}

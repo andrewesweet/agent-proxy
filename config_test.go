@@ -512,6 +512,59 @@ rules:
 	}
 }
 
+func TestLoadConfig_ListenDefault(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com
+    type: static
+    token_env: GH_TOKEN
+`)
+	t.Setenv("GH_TOKEN", "ghp_test")
+	cfg, _, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Listen != "unix:///run/agent-proxy/proxy.sock" {
+		t.Errorf("Listen = %q, want default unix:///run/agent-proxy/proxy.sock", cfg.Listen)
+	}
+}
+
+func TestLoadConfig_TCPRequiresOptIn(t *testing.T) {
+	path := writeTempConfig(t, `
+listen: ":18080"
+rules:
+  - host: api.github.com
+    type: static
+    token_env: GH_TOKEN
+`)
+	t.Setenv("GH_TOKEN", "ghp_test")
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "listen_allow_tcp") {
+		t.Errorf("expected 'listen_allow_tcp' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_TCPWithOptIn(t *testing.T) {
+	path := writeTempConfig(t, `
+listen: ":18080"
+listen_allow_tcp: true
+rules:
+  - host: api.github.com
+    type: static
+    token_env: GH_TOKEN
+`)
+	t.Setenv("GH_TOKEN", "ghp_test")
+	out := captureSlog(t, func() {
+		_, _, err := LoadConfig(path)
+		if err != nil {
+			t.Errorf("LoadConfig: %v", err)
+		}
+	})
+	if !strings.Contains(out, "Trust Boundary C") && !strings.Contains(out, "TCP") {
+		t.Errorf("expected TCP warning in log, got: %s", out)
+	}
+}
+
 func captureSlog(t *testing.T, fn func()) string {
 	t.Helper()
 	var buf bytes.Buffer

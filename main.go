@@ -29,6 +29,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"flag"
+	"io/fs"
 	"fmt"
 	"io"
 	"log/slog"
@@ -95,6 +96,43 @@ func main() {
 		}
 		go p.handleConn(conn)
 	}
+}
+
+// listen binds a net.Listener based on the configured address. A
+// "unix://" prefix creates a Unix domain socket with mode 0600. Any
+// other value is interpreted as a TCP address. Stale socket files are
+// removed before binding; non-socket files at the path produce an error.
+func listen(address string) (net.Listener, error) {
+	if !strings.HasPrefix(address, "unix://") {
+		return net.Listen("tcp", address)
+	}
+	path := strings.TrimPrefix(address, "unix://")
+
+	// Check for existing file and remove if it's a stale socket.
+	info, err := os.Stat(path)
+	switch {
+	case err == nil:
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf("listen path %q exists and is not a socket", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, fmt.Errorf("remove stale socket %q: %w", path, err)
+		}
+	case errors.Is(err, fs.ErrNotExist):
+		// Path doesn't exist — proceed to bind.
+	default:
+		return nil, fmt.Errorf("stat listen path %q: %w", path, err)
+	}
+
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("listen unix %q: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		ln.Close()
+		return nil, fmt.Errorf("chmod socket %q: %w", path, err)
+	}
+	return ln, nil
 }
 
 // proxy holds the configuration for the MITM proxy.

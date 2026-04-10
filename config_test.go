@@ -141,3 +141,82 @@ rules:
 		t.Errorf("expected 'field tokenfile' error, got: %v", err)
 	}
 }
+
+func TestLoadConfig_CAHalfPopulated(t *testing.T) {
+	path := writeTempConfig(t, `
+ca:
+  cert_file: /tmp/ca.crt
+rules:
+  - host: api.github.com
+    type: static
+    token_env: GH_TOKEN
+`)
+	t.Setenv("GH_TOKEN", "ghp_test")
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "key_file") {
+		t.Errorf("expected 'key_file' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_CABothEmpty(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com
+    type: static
+    token_env: GH_TOKEN
+`)
+	t.Setenv("GH_TOKEN", "ghp_test")
+	_, _, err := LoadConfig(path)
+	if err != nil {
+		t.Errorf("expected success (ephemeral CA), got: %v", err)
+	}
+}
+
+func TestLoadConfig_AuditLogDefaults(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com
+    type: static
+    token_env: GH_TOKEN
+`)
+	t.Setenv("GH_TOKEN", "ghp_test")
+	cfg, _, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.AuditLog.Level != "request" {
+		t.Errorf("AuditLog.Level = %q, want %q", cfg.AuditLog.Level, "request")
+	}
+}
+
+func TestLoadConfig_AuditLogInvalidLevel(t *testing.T) {
+	path := writeTempConfig(t, `
+audit_log:
+  level: verbose
+rules:
+  - host: api.github.com
+    type: static
+    token_env: GH_TOKEN
+`)
+	t.Setenv("GH_TOKEN", "ghp_test")
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "audit_log.level") {
+		t.Errorf("expected 'audit_log.level' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_AuditLogBadDirectory(t *testing.T) {
+	path := writeTempConfig(t, `
+audit_log:
+  file: /nonexistent/dir/audit.log
+rules:
+  - host: api.github.com
+    type: static
+    token_env: GH_TOKEN
+`)
+	t.Setenv("GH_TOKEN", "ghp_test")
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "audit_log") {
+		t.Errorf("expected 'audit_log' error, got: %v", err)
+	}
+}

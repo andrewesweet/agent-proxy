@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -126,6 +127,34 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("rule %d (%s): type required", i, rc.Host)
 		default:
 			return fmt.Errorf("rule %d (%s): unknown type %q (want static, oauth_refresh, or oauth_bearer)", i, rc.Host, rc.Type)
+		}
+	}
+
+	// CA: both set or both empty.
+	hasCert := cfg.CA.CertFile != ""
+	hasKey := cfg.CA.KeyFile != ""
+	if hasCert != hasKey {
+		if !hasCert {
+			return fmt.Errorf("ca.cert_file required when ca.key_file is set")
+		}
+		return fmt.Errorf("ca.key_file required when ca.cert_file is set")
+	}
+
+	// Audit log validation (schema only; implementation is TODO G1).
+	switch cfg.AuditLog.Level {
+	case "request", "body_hash":
+		// ok
+	default:
+		return fmt.Errorf("audit_log.level %q invalid (want \"request\" or \"body_hash\")", cfg.AuditLog.Level)
+	}
+	if cfg.AuditLog.File != "" {
+		dir := filepath.Dir(cfg.AuditLog.File)
+		info, err := os.Stat(dir)
+		if err != nil {
+			return fmt.Errorf("audit_log.file: parent directory %q: %w", dir, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("audit_log.file: %q is not a directory", dir)
 		}
 	}
 

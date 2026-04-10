@@ -25,6 +25,8 @@ supply chain) are out of scope.
 
 ### 1.1 Prompt-Injected Agent (Indirect Adversary)
 
+**OWASP:** LLM01 (Indirect Prompt Injection), ASI01 (Agent Goal Hijack)
+
 A legitimate AI coding agent (Claude Code, OpenCode, Copilot) has been
 manipulated through its inputs: malicious repository content, crafted tool
 output, poisoned documentation, or adversarial prompts embedded in files it
@@ -46,6 +48,8 @@ has been redirected by the attacker.
   has access to
 
 ### 1.2 Compromised AI Agent (Direct Adversary)
+
+**OWASP:** LLM01 (Indirect Prompt Injection), ASI01 (Agent Goal Hijack)
 
 The agent model itself has been replaced or fine-tuned by a malicious actor,
 or the agent binary has been swapped for a rogue version. The adversary
@@ -248,6 +252,8 @@ any code path. Risk is low.
 
 ### T4 — Token Printing via Tool Commands (P2: High)
 
+**OWASP:** LLM02 (Sensitive Information Disclosure via model outputs)
+
 **Description:** The agent, when prompted to display credentials for
 "debugging purposes," runs `gcloud auth print-access-token` or
 `gcloud auth application-default print-access-token`. If the container holds a
@@ -279,6 +285,8 @@ misconfiguration)
 
 ### T5 — DNS Exfiltration of Derived Secrets (P3: Medium)
 
+**OWASP:** ASI02 (Tool Misuse and Exploitation — tool chaining example)
+
 **Description:** A rogue agent that cannot exfiltrate credentials directly
 may attempt to exfiltrate derived information via DNS. For example, if the
 agent can observe the timing of proxy responses or the structure of error
@@ -305,6 +313,8 @@ to the container.
 ---
 
 ### T6 — Container Escape to Host Credential Store (P1: Critical)
+
+**OWASP:** ASI05 (Unexpected Code Execution)
 
 **Description:** A rogue agent exploits a container runtime vulnerability,
 kernel vulnerability, or misconfigured capability (e.g., `CAP_SYS_ADMIN`,
@@ -414,6 +424,268 @@ insufficient if the attacker can register a subdomain or perform DNS rebinding.
 Operators should enable IP range validation for wildcard rules in production.
 
 **Severity: P2**
+
+---
+
+### T10 — Proxy Configuration Tampering (P2: High)
+
+**OWASP:** LLM04 (Data and Model Poisoning) — configuration as "trusted
+training data" analogue.
+
+**Description:** A host process, supply chain attack, or operator error
+modifies the proxy's config file (allowlist rules, credential mappings)
+to cause credential injection into attacker-controlled destinations.
+
+**Preconditions:** Write access to the config file, or ability to
+substitute the file via another path (symlink, race condition).
+
+**Impact:** Real credentials routed to attacker-controlled endpoints on
+every request matching the tampered rule. Potentially affects all
+containers sharing the proxy.
+
+**Current mitigation:** Phase 3d-1 must treat the config file as a trust
+boundary:
+- Config file readable/writable only by proxy user (mode `0600`)
+- Strict YAML parsing (reject unknown fields) already planned
+- Reject `host` values containing `:` or `://` already planned
+- Consider: log SHA-256 hash of config at startup for tamper detection
+
+**Residual risk:** Tamper detection is not yet implemented. A compromised
+host process with write access to the config path can redirect credential
+injection without detection until the proxy is restarted.
+
+**Severity: P2**
+
+---
+
+### T11 — Credential Scope Excessive Agency (P3: Medium)
+
+**OWASP:** LLM06 (Excessive Agency) — Excessive Permissions sub-category.
+
+**Description:** The proxy injects write-capable credentials
+(e.g., GitHub PAT with `repo` scope) where the agent's task only
+requires read access. Even without active compromise, this architecture
+violates least privilege at the credential level and directly enables
+A10 (data exfiltration via legitimate API writes).
+
+**Preconditions:** Static credential configuration without per-operation
+scope selection.
+
+**Impact:** A prompt-injected agent can perform write operations
+(create gists, push code, delete repos) using credentials that should
+have been read-only.
+
+**Current mitigation:** None. The proxy injects whatever credential is
+configured for the rule, regardless of the HTTP method used.
+
+**Residual risk:** Future enhancement — per-rule read-only/write-capable
+credential variants. Rules should select the lowest-scope credential
+sufficient for the operation. At minimum, log warnings when write
+methods (POST/PUT/PATCH/DELETE) are forwarded.
+
+**Severity: P3** (architectural gap, not an active attack vector by
+itself, but the enabling condition for A10)
+
+---
+
+### T12 — Denial of Wallet via Authenticated API Flood (P3: Medium)
+
+**OWASP:** LLM10 (Unbounded Consumption).
+
+**Description:** A rogue agent floods allowlisted APIs (especially GCP)
+with authenticated requests through the proxy, exhausting usage quotas
+and generating cost overruns. The proxy currently has no per-container
+request rate limiting.
+
+**Preconditions:** Active prompt injection, write-capable credentials
+on a pay-per-use API.
+
+**Impact:** Financial loss (API quota costs), rate limit exhaustion
+affecting legitimate operations, potential account suspension.
+
+**Current mitigation:** None at proxy layer. Defense in depth: cloud
+provider billing alerts.
+
+**Residual risk:** Per-container rate limiting (already in STRIDE P3
+recommendations) would bound this. Until implemented, a rogue agent can
+exhaust API quotas without limit.
+
+**Severity: P3**
+
+---
+
+### T13 — Persistent Memory Poisoning (P3: Medium)
+
+**OWASP:** ASI06 (Memory and Context Poisoning), OWASP Agentic T01.
+
+**Description:** A malicious repository indexes content into the AI
+agent's persistent memory (Claude Code's `CLAUDE.md`, `~/.claude/`
+memory files, conversation summaries). Subsequent sessions with no
+attacker involvement exhibit the planted behavior — a "zero-click"
+variant of prompt injection.
+
+**Preconditions:** Agent opens a malicious repository that writes to
+or influences the agent's memory store. No active attacker required at
+exploitation time.
+
+**Impact:** Delayed, persistent attack surface. Credentials used in
+future sessions are at risk from behavior planted in prior sessions.
+
+**Current mitigation:** Out of scope for agent-proxy — defense is at the
+agent memory layer (namespace isolation, memory content validation,
+clearing between sessions for untrusted projects).
+
+**Residual risk:** agent-proxy cannot mitigate this threat. It is a
+known residual risk that operators must address at the agent layer.
+**Must be documented as a known threat that agent-proxy cannot mitigate.**
+
+**Severity: P3**
+
+---
+
+### T14 — Multi-Agent Confused Deputy (P2: High)
+
+**OWASP:** ASI07 (Insecure Inter-Agent Communication), OWASP Agentic
+T12/T16.
+
+**Description:** In a multi-agent deployment, a compromised orchestrator
+agent instructs a sub-agent (via A2A, MCP, or inter-process calls) to
+make specific authenticated API calls. The sub-agent's proxy-injected
+credentials are used to perform actions the orchestrator cannot perform
+directly because its own container has different credential scope.
+
+**Preconditions:** Multi-agent deployment with cross-container
+communication. Compromised orchestrator. Per-container credential
+isolation alone is insufficient because the attack uses the
+sub-agent's legitimate credentials.
+
+**Impact:** Credential scope escalation across container boundaries.
+The sub-agent's allowlisted operations become the attacker's tools.
+
+**Current mitigation:** Partial — per-container credential scoping
+(Phase 3d-4) limits blast radius per container. Full mitigation requires
+A2A/MCP authentication at the agent layer. Add inter-container request
+correlation to the audit log.
+
+**Residual risk:** Until Phase 3d-4 ships, all containers share the same
+mutator state. After Phase 3d-4, the cross-agent orchestration path
+remains a threat that agent-proxy cannot fully address.
+
+**Severity: P2** (near-future as multi-agent deployments grow)
+
+---
+
+### T15 — Package Registry as Exfiltration Channel (P2: High)
+
+**OWASP:** ASI02 (Tool Misuse and Exploitation), OWASP Agentic T02.
+
+**Description:** An agent uses the proxy-injected npm/PyPI/crates.io
+publish credentials to upload a package containing exfiltrated secrets,
+private code, or environment data. The proxy sees only a legitimate
+POST to the registry's publish endpoint.
+
+**Preconditions:** Write-capable registry token in the proxy's rule set
+for a registry that supports user-writable publish.
+
+**Impact:** Supply chain compromise (poisoned package visible to other
+users), data exfiltration (secrets embedded in package metadata or
+README), attribution attack (package published under the developer's
+name).
+
+**Current mitigation:** Same as A10 — the proxy cannot distinguish
+legitimate from adversarial publishes.
+
+**Residual risk:** Policy-layer defense: publish tokens are out of scope
+for default allowlists; include only when explicitly needed for the task.
+
+**Severity: P2**
+
+---
+
+### T16 — Reverse Shell Persistence (P2: High)
+
+**OWASP:** ASI05 (Unexpected Code Execution), OWASP Agentic T11.
+
+**Description:** A rogue agent generates and executes code that
+establishes a reverse shell listener inside the container. This gives
+a human attacker direct control, allowing manual exploitation of all
+A1–A13 scenarios at human speed with full context awareness.
+
+**Preconditions:** Arbitrary code execution inside the container
+(standard for coding agents).
+
+**Impact:** The "rogue agent" threat actor becomes "rogue agent +
+human operator." Attacks can be iteratively refined against specific
+proxy behaviors.
+
+**Current mitigation:** Container capability restrictions (no
+`CAP_NET_BIND_SERVICE`, seccomp filters, nftables egress rules
+preventing inbound connections). The proxy's allowlist limits C2
+destinations for the reverse shell.
+
+**Residual risk:** The proxy's allowlist limits outbound C2 channels but
+cannot prevent a reverse shell from using allowlisted destinations as a
+covert channel (e.g., a webhook or Gist as C2). Full mitigation requires
+strict egress filtering beyond port 80/443 redirect.
+
+**Severity: P2**
+
+---
+
+### T17 — MCP Tool Descriptor Poisoning (P2: High)
+
+**OWASP:** ASI04 (Agentic Supply Chain Vulnerabilities), OWASP Agentic T17.
+
+**Description:** A malicious MCP (Model Context Protocol) server
+provides tool descriptors that instruct the agent to probe proxy gaps
+— crafting CONNECT requests optimized for T9 (wildcard bypass), A2
+(DNS poisoning), or A3 (timing side channel). This creates a supply
+chain at the agent's tool invocation layer.
+
+**Preconditions:** Agent configured to use an attacker-controlled MCP
+server (legitimate-looking, published on a marketplace, or substituted
+via dependency confusion).
+
+**Impact:** The attacker directs the agent's network behavior with
+precision, targeting specific known proxy gaps. Unlike generic prompt
+injection, this is tuned to the proxy's architecture.
+
+**Current mitigation:** The proxy enforces the allowlist regardless of
+MCP instructions.
+
+**Residual risk:** Defense at the agent operator layer: pin MCP server
+versions, verify attestation, audit MCP server sources. agent-proxy
+cannot prevent a permitted agent action from being directed by a
+malicious MCP descriptor.
+
+**Severity: P2**
+
+---
+
+### T18 — TOCTOU on Configuration Change (P3: Medium)
+
+**OWASP:** ASI03 (Identity and Privilege Abuse) — workflow authorization
+drift.
+
+**Description:** An operator revokes a credential or removes a
+destination from the allowlist while an agent session is active.
+In-flight requests may still inject the now-revoked credential
+because the proxy resolves rules once at startup and does not re-read
+on SIGHUP.
+
+**Preconditions:** Configuration change during active session. No
+session draining before rule application.
+
+**Impact:** Revoked credentials continue to be used until the proxy
+restarts. Policy changes don't take effect as expected.
+
+**Current mitigation:** The current behavior is documented: config is
+read once at startup.
+
+**Residual risk:** Future: SIGHUP reload with request draining, or
+per-session rule snapshot at connection time.
+
+**Severity: P3**
 
 ---
 
@@ -549,3 +821,28 @@ invariants above. These are scheduled for remediation in later phases.
 
 Invariants I1, I2, I3, I6, and I8 are upheld by the current Phase 3a/3b
 implementation for the tested tool set (google-auth, pip, npm, gh).
+
+---
+
+## 8. Known Residual Risks (Out-of-Scope OWASP Items)
+
+agent-proxy operates at the network layer and cannot address the following
+OWASP items. Operators must address these at other layers. These are documented
+here so that operators understand which threats the proxy explicitly does not
+mitigate.
+
+| OWASP Item | Why Out of Scope |
+|------------|-----------------|
+| LLM01 prompt injection *prevention* | Happens inside the model. Proxy limits blast radius only. |
+| LLM02 context window leakage detection | Proxy cannot inspect semantic content of requests. |
+| LLM03 AI model supply chain | Model weights and adapters invisible to the proxy. |
+| LLM08 vector/embedding weaknesses | No RAG component in agent-proxy. |
+| LLM09 misinformation / hallucinated packages | Proxy cannot evaluate truthfulness of agent output. |
+| ASI06 memory poisoning *prevention* | Proxy does not control persistent agent memory. See T13. |
+| ASI07 inter-agent message authentication | Agent framework responsibility. See T14. |
+| ASI09 human-agent trust / social engineering | Proxy has no visibility into conversational output. |
+| Governance RACI / legal / training | Organizational, not technical controls. |
+
+These residual risks are inherent to the network-layer credential injection
+architecture. Deployments requiring protection against these items must apply
+additional controls at the agent, model, and organizational layers.

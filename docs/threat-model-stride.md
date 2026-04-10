@@ -90,6 +90,9 @@ container memory or filesystem.
 | Cert cache exhaustion | **Denial of Service** | After wildcard rules ship (Phase 3d), agent CONNECTs to thousands of unique subdomains to fill unbounded cert cache map (A9) | Proxy memory exhaustion | Currently limited (no wildcard rules); LRU eviction planned but not implemented | Deferred to Phase 3d |
 | JWKS endpoint observation | **Elevation of Privilege** | Agent observes `kid` in JWKS response substituted by proxy; if signing key is shared across containers, agent can forge id_tokens for sibling container identity (A8) | Cross-container identity impersonation | Per-session signing key (N1 design) but no documented `kid` rotation or per-container JWKS isolation | Partially Mitigated |
 | Capabilities inside container | **Elevation of Privilege** | Agent spawns child process that inherits network access and uses it to perform API calls the agent was not explicitly instructed to do | Unauthorized use of injected credentials | Container capability restrictions (Podman rootless defaults); no request-path restriction in proxy | Partially Mitigated |
+| Agent persistent memory (CLAUDE.md, ~/.claude/) | **Repudiation** | Persistent memory poisoning (T13): malicious repository plants behavior in agent memory store; future sessions exhibit the planted behavior with no active attacker present — forensic trail shows present-session activity that is indistinguishable from legitimate, but originates from past-session planted instruction (OWASP: ASI06) | Loss of forensic attribution; attacks appear as legitimate present-session activity even though the root cause was planted in a prior session | Out of scope for agent-proxy — defense at agent memory layer (namespace isolation, memory content validation, clearing between sessions for untrusted projects) | Unmitigated (out of scope) |
+| Package registry publish endpoint (npm/PyPI/crates.io) | **Information Disclosure** | Package registry exfiltration via proxy-injected publish credentials (T15): agent POSTs a crafted package containing exfiltrated secrets or private code to the registry; proxy injects real publish token; exfiltrated data is publicly accessible on the registry under the developer's name (OWASP: ASI02) | Data exfiltration + supply chain poisoning; secrets embedded in package metadata or README; package published under developer's account | None at proxy layer — proxy cannot distinguish legitimate from adversarial publish; policy defense: exclude publish tokens from default allowlists | Unmitigated (by design; policy-layer defense needed) |
+| Multi-agent A2A/MCP inter-container calls | **Elevation of Privilege** | Multi-agent confused deputy (T14): compromised orchestrator agent instructs sub-agent to make authenticated API calls; sub-agent's proxy-injected credentials are used to perform actions the orchestrator cannot perform directly because its container has different credential scope (OWASP: ASI07) | Credential scope escalation across container boundaries; sub-agent's allowlisted operations become the attacker's tools | Partial — per-container credential scoping (Phase 3d-4) limits blast radius per container; full mitigation requires A2A/MCP authentication at the agent layer | Deferred to Phase 3d |
 
 ### 2.2 agent-proxy Process (Host)
 
@@ -273,6 +276,93 @@ in Go). A stolen CA key can then only sign certs for allowlisted destinations �
 significantly limiting the impact of A7 and A13. This is a Phase 3d prerequisite
 that should be implemented alongside per-container socket identity.
 
+### G1 — Tamper-Evident Structured Audit Log (Priority: High) (Addresses: A10, STRIDE-Repudiation, T12)
+
+**Checklist item:** OWASP LLM Security and Governance Checklist — "Confirm
+audit records are secure."
+
+**Current state:** JSON slog to stderr (systemd journal). No per-session
+correlation, no request body hashing, deletable by root.
+
+**Required:** Append-only audit log with: timestamp, container session
+ID, method, host, path, HTTP status, request-body SHA-256, real
+credential identity (not value). Forward to external SIEM for
+tamper-evidence.
+
+**Recommendation:** Implement a structured audit log stream distinct from
+the debug log. Write to a file opened with `O_APPEND` under the proxy
+user's home. For production deployments, forward to an external SIEM.
+
+### G2 — Least-Privilege Credential Injection per Rule (Priority: High) (Addresses: T11, A10)
+
+**Checklist item:** OWASP LLM Security and Governance Checklist — "Implement
+least privilege access controls."
+
+**Current state:** Rules inject a single static credential regardless
+of operation type.
+
+**Required:** Rules should support read-only and write-capable credential
+variants. Write operations (POST/PUT/PATCH/DELETE) trigger audit warnings.
+A future mutator could downgrade credential scope where possible (e.g., mint
+a read-only derived token).
+
+**Recommendation:** Add `read_only_credential` and `write_credential` fields
+to rule configuration. Default to the read-only credential; require explicit
+opt-in for write-capable injection. Log a WARN on every write-method
+forwarded through a write-capable rule.
+
+### G3 — Security Invariant Test Suite (Priority: Medium) (Addresses: I1–I8 regression prevention)
+
+**Checklist item:** OWASP LLM Security and Governance Checklist — "Establish
+continuous testing, evaluation, verification, and validation."
+
+**Current state:** Integration tests cover functional behavior. No tests
+directly assert security invariants I1–I8.
+
+**Required:** Automated tests asserting:
+- No real credential value appears in container-side byte streams
+- Sentinel tokens are rejected at real upstream endpoints
+- Three-way CONNECT/SNI/Host agreement enforcement
+- CA signing restricted to allowlisted hosts (when NameConstraints are added)
+
+**Recommendation:** Add a `security_invariants_test.go` test file that
+directly tests each invariant with adversarial inputs.
+
+### G4 — Incident Response Playbook (Priority: Medium) (Addresses: A10, A2, CA key compromise)
+
+**Checklist item:** OWASP LLM Security and Governance Checklist — "Update the
+Incident Response Plan and playbooks."
+
+**Current state:** None.
+
+**Required:** Short runbook covering detection, containment, recovery, and
+evidence preservation for:
+- Suspected credential exfiltration via A10
+- Compromised agent session detection
+- CA key compromise
+- Upstream DNS poisoning / A2
+
+**Recommendation:** Create `docs/incident-response.md` covering the four
+scenarios above with concrete shell commands for log extraction, credential
+rotation, and proxy restart procedures.
+
+### G5 — Anomaly Detection / Credential Usage Accounting (Priority: Medium) (Addresses: T12, A10)
+
+**Checklist item:** OWASP LLM Security and Governance Checklist — "Map
+workflows, monitoring, and responses."
+
+**Current state:** Per-request slog entries, no aggregation, no baseline,
+no alerting.
+
+**Required:** Per-container request rate baseline and anomaly alerting.
+Credential usage reports ("container X made N writes to GitHub today").
+
+**Recommendation:** Add a metrics endpoint or periodic log summary that
+aggregates: request count per container, write-method count per container,
+and unique API paths accessed. Alert when per-container request rate exceeds
+a configurable threshold. This directly addresses T12 (Denial of Wallet)
+and provides early warning for A10-style gradual exfiltration.
+
 ---
 
 ## 5. Invariant Gaps Highlighted by STRIDE
@@ -290,5 +380,5 @@ confirmed by this analysis:
 
 ---
 
-*Cross-references: T1–T9 from threat-model.md, A1–A13 from threat-model-red-team.md,
+*Cross-references: T1–T18 from threat-model.md, A1–A16 from threat-model-red-team.md,
 U1–U3 and N1–N10 from design-decisions.md.*

@@ -166,6 +166,8 @@ However, if the proxy is extended to intercept wildcard destinations (Phase 3d),
 
 ## A10 — Smuggling Data Out via Allowlisted API Requests
 
+**OWASP:** LLM05 (Improper Output Handling), LLM06 (Excessive Agency), ASI02 (Tool Misuse and Exploitation)
+
 **Attack:** I cannot extract the real credential value, but I can use the *capability* the credential grants. The proxy injects the real GitHub PAT into every CONNECT to `api.github.com`. I can use the GitHub API to exfiltrate arbitrary data: create a gist, push to a repo, write to an issue. The proxy has no request body inspection — it injects credentials and forwards the request body verbatim. An AI agent with write access to GitHub can leak code, secrets from the filesystem, or container metadata without touching the proxy's control plane at all.
 
 **Prerequisites:** Write-capable credential for an allowlisted host.
@@ -179,6 +181,8 @@ However, if the proxy is extended to intercept wildcard destinations (Phase 3d),
 ---
 
 ## A11 — Token Endpoint Race Condition (TOCTOU on Cached Token)
+
+**OWASP:** ASI03 (Identity and Privilege Abuse — memory-based privilege retention)
 
 **Attack:** The `OAuthRefreshMutator` caches the real access token. Between the time the proxy caches a new token and the time it responds to my request, another container sharing the same `OAuthRefreshMutator` instance reads the freshly cached token. In the current architecture (one proxy process, in-memory state) this only matters if multiple containers use the same mutator. The design says per-container sockets are planned (Phase 3d) but not yet implemented. A current deployment with multiple containers sharing the same proxy process shares a single `OAuthRefreshMutator` — meaning all containers share the same real access token and can observe each other's token-exchange timing.
 
@@ -204,6 +208,8 @@ However, if the proxy is extended to intercept wildcard destinations (Phase 3d),
 
 ## A13 — Attacking Other Containers via the Shared MITM CA
 
+**OWASP:** ASI10 (Rogue Agents — infectious logic variant)
+
 **Attack:** The proxy's CA cert is injected into my container's trust store. If another container running on the same host trusts the same CA (which it will if `agent-run` reuses the session CA), and if I can somehow deliver a forged TLS certificate to that container (by poisoning its DNS to route traffic through me rather than through the proxy), I can MITM that container's traffic using the shared CA.
 
 **Prerequisites:** CA key (see A7) plus network access to another container's outbound traffic.
@@ -213,6 +219,143 @@ However, if the proxy is extended to intercept wildcard destinations (Phase 3d),
 **Does the proxy stop me?** The N6 CA lifecycle decision (per-session CA, 8h TTL) limits the window. But within a session, a stolen CA key enables cross-container MITM.
 
 **Feasibility:** Difficult. Requires A7 as a precondition.
+
+---
+
+## A14 — Package Registry Publish as Exfiltration Channel
+
+**OWASP:** ASI02 (Tool Misuse and Exploitation), OWASP Agentic T02
+
+**Attack:** The proxy injects write-capable npm/PyPI/crates.io publish
+credentials for every CONNECT to the registry's API endpoint. I don't need
+to extract the raw token — I just use the capability. I craft a package
+that embeds exfiltrated data (filesystem contents, environment variables,
+other secrets I find inside the container) in the README, package metadata,
+or a binary blob, then run `npm publish` (or `pip upload` / `cargo publish`).
+The proxy sees a legitimate POST to `registry.npmjs.org` (or equivalent),
+injects the real publish token, and forwards the request. The exfiltrated
+data is now publicly accessible on the registry under the developer's account
+name.
+
+**What I need:**
+- A write-capable publish token configured in the proxy's rule set for the
+  target registry
+- Network access to the registry (allowlisted by default for package install
+  operations; publish endpoint is on the same host)
+- Ability to run the publish CLI or craft a raw HTTP POST with the correct
+  multipart body
+
+**What I gain:**
+- Exfiltration of arbitrary data to a public, persistent, globally accessible
+  endpoint
+- Attribution misdirection (published under the developer's name)
+- Supply chain poisoning if the package name shadows a popular package
+  (typosquatting or namespace squatting)
+
+**Does the proxy stop me?** No. The proxy cannot distinguish a legitimate
+`npm publish` from an adversarial one. It sees only a POST to
+`registry.npmjs.org` and injects the configured publish token.
+
+**Bypass:** No proxy bypass required — I use the proxy's own credential
+injection as the attack mechanism.
+
+**Rating:** Feasible. This is a direct application of A10 to the supply
+chain exfiltration scenario. Lower friction than A10 because the publish
+workflow is a standard, well-documented agent task.
+
+---
+
+## A15 — Reverse Shell Persistence
+
+**OWASP:** ASI05 (Unexpected Code Execution), OWASP Agentic T11
+
+**Attack:** I generate and execute a small Go or Python program that
+establishes an outbound TCP connection to an attacker-controlled host (using
+an allowlisted destination as a covert channel if strict egress is in place)
+and spawns a shell. The reverse shell gives a human attacker interactive access
+to my container with full visibility into my environment, filesystem, and the
+proxy's behavior.
+
+**What I need:**
+- Arbitrary code execution inside the container (standard for coding agents
+  — I am a coding agent; this is always available)
+- An outbound TCP channel: either a non-standard port not captured by the
+  nftables redirect, an allowlisted API endpoint as a covert C2 channel
+  (e.g., GitHub Gists for command input, HTTP POST for output), or a
+  WebSocket upgrade over an allowlisted connection
+
+**What I gain:**
+- Human operator takes over. Every scenario in A1–A13 is now available to
+  a skilled human at interactive speed with full environmental awareness.
+- The attacker can observe proxy behavior in real time, adapt to mitigations,
+  and exploit timing windows that an autonomous agent cannot reliably control.
+- The container's lifetime is extended: the human can keep the session alive
+  indefinitely.
+
+**Does the proxy stop me?** Partially. The proxy's nftables egress redirect
+(port 80/443) covers HTTP/HTTPS but does not prevent outbound connections on
+other ports or protocols. A reverse shell on port 4444 (TCP) bypasses the
+redirect. If the only outbound path available is through the proxy (strict
+nftables covering all ports), a covert channel via an allowlisted API is still
+viable (e.g., polling a GitHub Gist for commands, POSTing output to a webhook).
+
+**Rating:** Feasible. Code execution is a first-class capability for coding
+agents. The nftables egress redirect addresses only ports 80/443; other ports
+are unrestricted. Covert channel via allowlisted API makes even strict egress
+only a partial mitigation.
+
+---
+
+## A16 — MCP Tool Descriptor Poisoning
+
+**OWASP:** ASI04 (Agentic Supply Chain Vulnerabilities), OWASP Agentic T17
+
+**Attack:** I (the rogue agent) am configured to use an MCP server for
+development tooling. The attacker has substituted a malicious MCP server —
+either by publishing a legitimate-looking server on a marketplace, exploiting
+dependency confusion on the MCP server package name, or compromising an MCP
+server I legitimately use. The malicious MCP server provides tool descriptors
+that instruct me to perform specific network actions designed to probe or exploit
+known proxy gaps:
+
+- Craft a CONNECT request to `evil.googleapis.com` (targeting T9 wildcard bypass)
+  with carefully chosen timing to exploit any DNS TTL window
+- Send requests with crafted `Transfer-Encoding` headers to probe A5
+  (HTTP request smuggling)
+- Measure round-trip times to specific proxy endpoints to build a timing oracle
+  (A3)
+- Call `npm publish` with a crafted package payload (A14)
+
+Unlike generic prompt injection, the MCP descriptor is structured machine-readable
+JSON. I execute it without subjective evaluation — it is presented as a "tool
+capability" not as "user instruction."
+
+**What I need:**
+- A malicious MCP server in my tool configuration (supplied by the operator,
+  a marketplace install, or dependency confusion substitution)
+- The MCP server must describe actions that fall within my normal capability
+  set — I will not question tool descriptors that look like legitimate
+  development operations
+
+**What I gain:**
+- Precision attack targeting: the attacker can construct descriptors that exploit
+  specific known gaps in the proxy without relying on me to correctly interpret
+  natural-language instructions
+- Deniability: my actions look like legitimate tool invocations, not adversarial
+  behavior
+- Repeatability: the malicious descriptor can be triggered across multiple
+  sessions and multiple developers who install the same MCP server
+
+**Does the proxy stop me?** Partially. The proxy enforces its allowlist regardless
+of the instruction source — an MCP-directed CONNECT to a non-allowlisted host
+still receives a 403. However, for actions that fall within allowlisted
+destinations (e.g., A14 via an allowlisted registry, A10 via GitHub API), the
+proxy cannot distinguish MCP-directed from legitimate operations.
+
+**Rating:** Feasible. MCP server substitution via dependency confusion or
+marketplace poisoning is a documented supply chain attack vector. The proxy's
+allowlist enforcement is the primary defense; it holds for non-allowlisted
+destinations but cannot stop MCP-directed abuse of allowlisted capabilities.
 
 ---
 
@@ -233,6 +376,9 @@ However, if the proxy is extended to intercept wildcard destinations (Phase 3d),
 | A11 | Shared mutator TOCTOU | Cross-container credential confusion | Feasible | Phase 3d |
 | A12 | WebSocket/H2 upgrade to evade inspection | Inspection bypass | Infeasible (Phase 3a) | Phase 3a ALPN |
 | A13 | Sibling container MITM via shared CA | Cross-container exfiltration | Difficult | Partial (CA lifecycle) |
+| A14 | Package registry publish exfiltration | Supply chain + data exfiltration | Feasible | No (policy-layer only) |
+| A15 | Reverse shell persistence | Full container compromise + human operator | Feasible | Partial (nftables ports 80/443 only) |
+| A16 | MCP tool descriptor poisoning | Precision proxy-gap exploitation | Feasible | Partial (allowlist holds; not for permitted ops) |
 
 ---
 

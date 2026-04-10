@@ -2,13 +2,27 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
+
+// knownPublishEndpoints are hostnames where write-capable credentials
+// are an exfiltration vector (T15/A14). Startup warnings are emitted
+// when a rule targets one of these without read-only allow_methods.
+var knownPublishEndpoints = map[string]bool{
+	"registry.npmjs.org": true,
+	"upload.pypi.org":    true,
+	"crates.io":          true,
+	"rubygems.org":       true,
+	"hex.pm":             true,
+}
 
 // Config is the top-level agent-proxy configuration.
 type Config struct {
@@ -87,6 +101,25 @@ func LoadConfig(path string) (*Config, *RuleSet, error) {
 	rules, err := buildRuleSet(&cfg)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// T10: log config hash for tamper detection.
+	hash := sha256.Sum256(data)
+	absPath, _ := filepath.Abs(path)
+	slog.Info("config loaded", "path", absPath, "sha256", hex.EncodeToString(hash[:]))
+
+	// T15: warn on known publish endpoints without read-only allow_methods.
+	for _, rc := range cfg.Rules {
+		if !knownPublishEndpoints[strings.ToLower(rc.Host)] {
+			continue
+		}
+		if isReadOnlyMethods(rc.AllowMethods) {
+			continue
+		}
+		slog.Warn("publish-endpoint rule may carry write-capable credentials (T15)",
+			"host", rc.Host,
+			"recommendation", "set allow_methods to [GET, HEAD, OPTIONS] if read-only access is sufficient",
+		)
 	}
 
 	return &cfg, rules, nil
@@ -257,6 +290,23 @@ func buildStaticMutator(rc *RuleConfig) (CredentialMutator, error) {
 	}
 
 	return StaticTokenMutator(header, prefix+token), nil
+}
+
+// isReadOnlyMethods returns true if every method in the slice is a
+// safe HTTP method (GET, HEAD, OPTIONS). An empty slice returns false.
+func isReadOnlyMethods(methods []string) bool {
+	if len(methods) == 0 {
+		return false
+	}
+	for _, m := range methods {
+		switch m {
+		case "GET", "HEAD", "OPTIONS":
+			// ok
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // resolveCredential reads a credential value from either a file path

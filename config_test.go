@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -505,5 +509,89 @@ rules:
 		if rc.RefreshTokenEnv != "" {
 			t.Errorf("rule %d: RefreshTokenEnv = %q, want empty after zeroing", i, rc.RefreshTokenEnv)
 		}
+	}
+}
+
+func captureSlog(t *testing.T, fn func()) string {
+	t.Helper()
+	var buf bytes.Buffer
+	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	prev := slog.Default()
+	slog.SetDefault(slog.New(handler))
+	defer slog.SetDefault(prev)
+	fn()
+	return buf.String()
+}
+
+func TestLoadConfig_ConfigHashLogged(t *testing.T) {
+	contents := `
+rules:
+  - host: api.github.com
+    type: static
+    token_env: GH_TOKEN
+`
+	path := writeTempConfig(t, contents)
+	t.Setenv("GH_TOKEN", "ghp_test")
+
+	// Use the exact bytes written to the file.
+	data, _ := os.ReadFile(path)
+	wantHash := sha256.Sum256(data)
+	wantHex := hex.EncodeToString(wantHash[:])
+
+	out := captureSlog(t, func() {
+		_, _, err := LoadConfig(path)
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "sha256="+wantHex) {
+		t.Errorf("log output missing sha256=%s; got: %s", wantHex, out)
+	}
+	if !strings.Contains(out, "config loaded") {
+		t.Errorf("log output missing 'config loaded'; got: %s", out)
+	}
+}
+
+func TestLoadConfig_RegistryPublishWarning(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: registry.npmjs.org
+    type: static
+    token_env: NPM_TOKEN
+`)
+	t.Setenv("NPM_TOKEN", "npm_test")
+
+	out := captureSlog(t, func() {
+		_, _, err := LoadConfig(path)
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "T15") && !strings.Contains(out, "publish") {
+		t.Errorf("expected publish-endpoint warning in log, got: %s", out)
+	}
+}
+
+func TestLoadConfig_RegistryPublishWarningSuppressed(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: registry.npmjs.org
+    type: static
+    token_env: NPM_TOKEN
+    allow_methods: [GET, HEAD]
+`)
+	t.Setenv("NPM_TOKEN", "npm_test")
+
+	out := captureSlog(t, func() {
+		_, _, err := LoadConfig(path)
+		if err != nil {
+			t.Fatalf("LoadConfig: %v", err)
+		}
+	})
+
+	if strings.Contains(out, "publish") {
+		t.Errorf("warning should be suppressed with read-only allow_methods; got: %s", out)
 	}
 }

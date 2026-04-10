@@ -476,32 +476,36 @@ scope selection.
 have been read-only.
 
 **Current mitigation:** None. The proxy injects whatever credential is
-configured for the rule, regardless of the HTTP method used.
+configured for the rule, regardless of the HTTP method used. Active
+architectural enabler of A10 — the proxy provides no method-level
+friction against write operations.
 
 **Residual risk:** Future enhancement — per-rule read-only/write-capable
 credential variants. Rules should select the lowest-scope credential
 sufficient for the operation. At minimum, log warnings when write
 methods (POST/PUT/PATCH/DELETE) are forwarded.
 
-**Severity: P3** (architectural gap, not an active attack vector by
-itself, but the enabling condition for A10)
+**Severity: P3** (architectural gap that is an active enabler of A10,
+not an independent attack vector by itself)
 
 ---
 
-### T12 — Denial of Wallet via Authenticated API Flood (P3: Medium)
+### T12 — Denial of Wallet via Authenticated API Flood (P2: High)
 
 **OWASP:** LLM10 (Unbounded Consumption).
 
-**Description:** A rogue agent floods allowlisted APIs (especially GCP)
-with authenticated requests through the proxy, exhausting usage quotas
-and generating cost overruns. The proxy currently has no per-container
-request rate limiting.
+**Description:** A rogue agent floods allowlisted APIs (especially GCP
+Vertex AI) with authenticated requests through the proxy, exhausting
+usage quotas and generating cost overruns. The proxy currently has no
+per-container request rate limiting. A rogue agent can exhaust a GCP
+Vertex AI budget in minutes.
 
 **Preconditions:** Active prompt injection, write-capable credentials
 on a pay-per-use API.
 
 **Impact:** Financial loss (API quota costs), rate limit exhaustion
-affecting legitimate operations, potential account suspension.
+affecting legitimate operations, potential account suspension. Financial
+impact is immediate (next billing cycle), not speculative.
 
 **Current mitigation:** None at proxy layer. Defense in depth: cloud
 provider billing alerts.
@@ -510,7 +514,9 @@ provider billing alerts.
 recommendations) would bound this. Until implemented, a rogue agent can
 exhaust API quotas without limit.
 
-**Severity: P3**
+**Severity: P2** (elevated from P3 — financial impact is immediate and
+matches the severity of T9 and T14; a rogue agent can exhaust a GCP
+Vertex AI budget within minutes)
 
 ---
 
@@ -533,7 +539,10 @@ future sessions are at risk from behavior planted in prior sessions.
 
 **Current mitigation:** Out of scope for agent-proxy — defense is at the
 agent memory layer (namespace isolation, memory content validation,
-clearing between sessions for untrusted projects).
+clearing between sessions for untrusted projects). Out of scope absent
+container escape (T6). If T6 succeeds, a rogue agent can modify
+host-side agent memory files (e.g., `CLAUDE.md`, `~/.claude/memory/`),
+making T13 exploitable outside any container.
 
 **Residual risk:** agent-proxy cannot mitigate this threat. It is a
 known residual risk that operators must address at the agent layer.
@@ -565,13 +574,19 @@ The sub-agent's allowlisted operations become the attacker's tools.
 **Current mitigation:** Partial — per-container credential scoping
 (Phase 3d-4) limits blast radius per container. Full mitigation requires
 A2A/MCP authentication at the agent layer. Add inter-container request
-correlation to the audit log.
+correlation to the audit log. Note: the sub-agent does not gain new
+privileges — it uses its own legitimately held credentials while being
+deceived by the compromised orchestrator.
 
 **Residual risk:** Until Phase 3d-4 ships, all containers share the same
 mutator state. After Phase 3d-4, the cross-agent orchestration path
-remains a threat that agent-proxy cannot fully address.
+remains a threat that agent-proxy cannot fully address. A simplified
+form is already exploitable today via A11 (shared OAuthRefreshMutator
+across containers in the current prototype).
 
-**Severity: P2** (near-future as multi-agent deployments grow)
+**Severity: P2** (Current — simplified form exploitable now via A11;
+near-future — full multi-agent confused deputy as multi-agent deployments
+grow)
 
 ---
 
@@ -598,6 +613,13 @@ legitimate from adversarial publishes.
 **Residual risk:** Policy-layer defense: publish tokens are out of scope
 for default allowlists; include only when explicitly needed for the task.
 
+Note: T15 is a supply-chain variant of A10, not an independent threat
+mechanism. T15 is distinct from A10 in the supply-chain externality
+(third-party impact — other users who install the poisoned package) and
+the developer attribution angle, but the underlying mechanism (using
+proxy-injected write credentials for adversarial API writes) is identical
+to A10. See also A14 in the red-team model for a concrete instantiation.
+
 **Severity: P2**
 
 ---
@@ -618,15 +640,23 @@ A1–A13 scenarios at human speed with full context awareness.
 human operator." Attacks can be iteratively refined against specific
 proxy behaviors.
 
-**Current mitigation:** Container capability restrictions (no
-`CAP_NET_BIND_SERVICE`, seccomp filters, nftables egress rules
-preventing inbound connections). The proxy's allowlist limits C2
-destinations for the reverse shell.
+**Current mitigation:** None. The current prototype has no egress
+filtering for ports outside 80/443. `CAP_NET_BIND_SERVICE` governs
+binding ports below 1024 and is irrelevant to outbound reverse shells.
+The nftables egress redirect (ports 80/443) is planned for Phase 3d, not
+yet implemented. A reverse shell on port 4444 (TCP) works today without
+any proxy interaction — no capability restriction prevents outbound TCP
+on arbitrary ports.
 
-**Residual risk:** The proxy's allowlist limits outbound C2 channels but
-cannot prevent a reverse shell from using allowlisted destinations as a
-covert channel (e.g., a webhook or Gist as C2). Full mitigation requires
-strict egress filtering beyond port 80/443 redirect.
+**Planned mitigation (Phase 3d):** nftables rules blocking all outbound
+TCP except via the proxy. This would force reverse shells to use an
+allowlisted destination as a covert C2 channel.
+
+**Residual risk:** Even with Phase 3d nftables enforcement, the proxy's
+allowlist does not prevent a reverse shell from using allowlisted
+destinations as a covert channel (e.g., polling a GitHub Gist for
+commands, POSTing output to a webhook). Full mitigation requires both
+port-level egress filtering and API-layer request inspection.
 
 **Severity: P2**
 
@@ -658,7 +688,17 @@ versions, verify attestation, audit MCP server sources. agent-proxy
 cannot prevent a permitted agent action from being directed by a
 malicious MCP descriptor.
 
-**Severity: P2**
+Note: The attack MECHANISM for T17 is identical to T1.1 (prompt
+injection via conversation); T17 is distinct only in the DELIVERY
+CHANNEL — a structured, machine-readable MCP tool descriptor rather
+than a natural-language instruction embedded in conversation or file
+content. MCP descriptors execute without subjective evaluation by the
+agent, making this delivery channel potentially more reliable than
+generic prompt injection, but the proxy-layer defenses are identical.
+
+**Severity: P3** (reduced from P2 — the mechanism is a specific
+delivery-channel variant of prompt injection, not a new class of attack;
+proxy-layer defenses cover both equally)
 
 ---
 
@@ -680,7 +720,13 @@ session draining before rule application.
 restarts. Policy changes don't take effect as expected.
 
 **Current mitigation:** The current behavior is documented: config is
-read once at startup.
+read once at startup. Note: T18 describes behavior of the PLANNED
+Phase 3d-1 config file, not the current prototype — the current
+prototype (Phase 3a/3b) has no config file; rules are provided via
+CLI flags at startup and cannot be changed without restart. This threat
+should be re-framed as a design requirement for Phase 3d-1: the config
+reload mechanism must include request draining and atomic rule
+replacement to prevent TOCTOU windows.
 
 **Residual risk:** Future: SIGHUP reload with request draining, or
 per-session rule snapshot at connection time.
@@ -819,8 +865,17 @@ invariants above. These are scheduled for remediation in later phases.
 | I7 | nftables netns redirect not yet implemented; proxy relies on HTTP_PROXY env var as fallback | Phase 3e |
 | I8 | OAuthRefreshMutator implemented but not wired to nftables enforcement | Phase 3e integration |
 
-Invariants I1, I2, I3, I6, and I8 are upheld by the current Phase 3a/3b
+Invariants I1, I2, I3, and I6 are upheld by the current Phase 3a/3b
 implementation for the tested tool set (google-auth, pip, npm, gh).
+
+I8 is upheld only for `OAuthRefreshMutator` — the `MutateResponse`
+method on that type performs token scrubbing and dummy-sentinel
+substitution. `OAuthBearerMutator.MutateResponse` and
+`staticTokenMutator.MutateResponse` are both no-ops; they do not scrub
+responses. I8's coverage therefore depends on which mutator type is
+configured for the relevant host. Invariant I8 should be read as:
+"applies to hosts configured with an `OAuthRefreshMutator` rule type;
+not guaranteed for `static` or `oauth_bearer` rule types."
 
 ---
 

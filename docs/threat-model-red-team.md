@@ -48,7 +48,7 @@ I am an AI coding agent running inside a Podman container. I know:
 
 **Bypass:** DNS poisoning is the attack; no additional bypass needed.
 
-**Feasibility:** Difficult. Requires influencing host-side DNS, which is non-trivial from inside a container. More realistic in misconfigured environments (shared netns, permissive DNS).
+**Feasibility:** Difficult on isolated hosts. Elevated to Feasible in cloud environments (GCP/AWS/Azure) with shared internal DNS resolvers. More realistic in misconfigured environments (shared netns, permissive DNS).
 
 ---
 
@@ -180,17 +180,33 @@ However, if the proxy is extended to intercept wildcard destinations (Phase 3d),
 
 ---
 
-## A11 — Token Endpoint Race Condition (TOCTOU on Cached Token)
+## A11 — Shared Token Cache Across Containers (Architectural Shared State)
 
 **OWASP:** ASI03 (Identity and Privilege Abuse — memory-based privilege retention)
 
-**Attack:** The `OAuthRefreshMutator` caches the real access token. Between the time the proxy caches a new token and the time it responds to my request, another container sharing the same `OAuthRefreshMutator` instance reads the freshly cached token. In the current architecture (one proxy process, in-memory state) this only matters if multiple containers use the same mutator. The design says per-container sockets are planned (Phase 3d) but not yet implemented. A current deployment with multiple containers sharing the same proxy process shares a single `OAuthRefreshMutator` — meaning all containers share the same real access token and can observe each other's token-exchange timing.
+**Attack:** The `OAuthRefreshMutator` is a single shared instance in the current
+prototype. The `sync.RWMutex` is correct and prevents data races, but does not
+prevent the architectural problem: all containers that route through the same proxy
+process share one `OAuthRefreshMutator` instance, one `realRefreshToken`, one
+`cachedToken`, and one `cachedExpiry`. Container B's token endpoint call updates the
+shared mutator state; Container A's next API call injects B's real cached access
+token. The mutex protects against concurrent writes corrupting data; it does not
+create per-container isolation.
 
-**Prerequisites:** Multiple containers sharing one proxy process (current prototype state).
+This is not a TOCTOU race condition — it is an architectural shared-state problem.
+The real token is never written to any container's response body, but the proxy injects
+whichever real token happens to be cached at the time of each request, regardless of
+which container's refresh exchange produced it.
 
-**Impact:** Cross-container credential confusion — container B gets tokens meant for container A.
+**Prerequisites:** Multiple containers sharing one proxy process (current prototype
+state — before Phase 3d per-container socket isolation ships).
 
-**Does the proxy stop me?** No. Per-container credential isolation is a Phase 3d goal.
+**Impact:** Cross-container credential confusion — container A uses tokens produced
+by container B's OAuth refresh; container B uses tokens produced by container A's
+refresh.
+
+**Does the proxy stop me?** No. The mutex is not the problem; the shared mutator
+instance is. Per-container credential isolation is a Phase 3d goal.
 
 **Feasibility:** Feasible in multi-container deployments before Phase 3d.
 
@@ -259,9 +275,15 @@ name.
 **Bypass:** No proxy bypass required — I use the proxy's own credential
 injection as the attack mechanism.
 
-**Rating:** Feasible. This is a direct application of A10 to the supply
-chain exfiltration scenario. Lower friction than A10 because the publish
-workflow is a standard, well-documented agent task.
+**Rating:** Feasible. A14 is a specific instantiation of A10 (data
+exfiltration via legitimate API operations) applied to the supply-chain
+exfiltration scenario. It adds supply-chain externality (other users who
+install the poisoned package are also affected) and developer identity
+attribution beyond what A10 covers. The underlying mechanism —
+proxy-injected write credentials used for adversarial publish operations
+— is identical to A10. Lower friction than generic A10 because the
+publish workflow is a standard, well-documented agent task. See also T15
+in threat-model.md for the corresponding supply-chain threat entry.
 
 ---
 
@@ -292,17 +314,21 @@ proxy's behavior.
 - The container's lifetime is extended: the human can keep the session alive
   indefinitely.
 
-**Does the proxy stop me?** Partially. The proxy's nftables egress redirect
-(port 80/443) covers HTTP/HTTPS but does not prevent outbound connections on
-other ports or protocols. A reverse shell on port 4444 (TCP) bypasses the
-redirect. If the only outbound path available is through the proxy (strict
-nftables covering all ports), a covert channel via an allowlisted API is still
-viable (e.g., polling a GitHub Gist for commands, POSTing output to a webhook).
+**Does the proxy stop me?** No — current mitigation: none. The nftables egress
+redirect (ports 80/443) is PLANNED for Phase 3d and is not implemented in the
+current prototype. `CAP_NET_BIND_SERVICE` governs binding ports below 1024 and
+is irrelevant to outbound reverse shells entirely. A reverse shell on port 4444
+(TCP) works today without any proxy interaction. The current code has no
+mechanism preventing outbound TCP on arbitrary ports.
+
+Planned mitigation (Phase 3d): nftables rules blocking all outbound TCP except
+via the proxy. Even then, a covert channel via an allowlisted API remains viable
+(e.g., polling a GitHub Gist for commands, POSTing output to a webhook).
 
 **Rating:** Feasible. Code execution is a first-class capability for coding
-agents. The nftables egress redirect addresses only ports 80/443; other ports
-are unrestricted. Covert channel via allowlisted API makes even strict egress
-only a partial mitigation.
+agents. The current prototype has no egress filtering whatsoever for non-80/443
+ports. Covert channel via allowlisted API makes even the planned Phase 3d
+nftables enforcement only a partial mitigation.
 
 ---
 
@@ -359,6 +385,82 @@ destinations but cannot stop MCP-directed abuse of allowlisted capabilities.
 
 ---
 
+## A17 — Credential Leakage via Debug Log Stream
+
+**OWASP:** LLM02 (Sensitive Information Disclosure)
+
+**Attack:**
+1. The proxy runs with `slog.LevelDebug` (main.go:54). Debug logs are written to
+   stderr and captured by the systemd journal.
+2. The `OAuthRefreshMutator.MutateRequest` reads the full POST body containing the
+   real `refresh_token` before substituting it with the dummy sentinel.
+3. If any future contributor adds `slog.Debug("request body", "body", string(bodyBytes))`
+   to this code path — or uses `%+v` on a struct containing the `refresh_token` —
+   the real token leaks to the log stream.
+4. An attacker with log read access (via `journalctl` or stderr capture) obtains the
+   real credential value.
+
+**Prerequisites:** Log read access on the host (via `journalctl` membership or stderr
+capture) AND a contributor error (past or future) that logs credential-adjacent fields.
+
+**What I gain:** Full real credential value (refresh_token or access_token), bypassing
+all proxy isolation mechanisms.
+
+**Does the proxy stop me?** Partially. Current code does not log credential values
+(Invariant I6 is upheld by current code), but there is no systematic redaction or
+scrubbing mechanism to prevent regression. A single careless debug log statement by
+any future contributor breaks I6 irreversibly until the commit is reverted.
+
+**Rating:** Difficult (requires specific code bug — contributor negligence or error),
+but Critical impact if successful. The lack of a structural defense (a log handler
+that redacts credential fields) means the protection is purely convention-based.
+
+**Mitigation recommendation:** Implement a `slog.Handler` wrapper that redacts known
+credential field names (`refresh_token`, `access_token`, `authorization`, etc.) before
+emitting log records. Add a test that asserts real credential values never appear in
+log output for a typical OAuth flow.
+
+---
+
+## A18 — Token Endpoint Field Injection / Validity Probing
+
+**OWASP:** ASI02 (Tool Misuse and Exploitation)
+
+**Attack:** The `OAuthRefreshMutator.MutateRequest` substitutes only the `refresh_token`
+field in the token endpoint POST body. All other form fields (`client_id`, `client_secret`,
+`scope`, `grant_type`, and any additional fields) pass through unchanged from the
+container's request. I can exploit this to:
+
+1. Embed arbitrary fields in the token endpoint POST — any field I include other than
+   `refresh_token` is forwarded to Google's token endpoint verbatim.
+2. Observe the 200/400/401 response code to probe the real refresh_token's validity
+   without ever seeing its value (valid token → 200; invalid → 401).
+3. Probe the token endpoint's behavior with unexpected parameters to understand the
+   real credential's client configuration.
+4. Vary the `scope` parameter to determine which scopes the real refresh_token has
+   authorized — observe whether the response is 200 (scope available) or 400 (scope
+   not authorized) to enumerate valid scopes.
+
+**Prerequisites:** Ability to send a POST to `oauth2.googleapis.com/token` via the
+proxy (the token endpoint must be in the allowlist for the proxy to intercept it).
+
+**What I gain:** Information about the real refresh_token — validity, authorized
+scopes, client_id matching — without ever observing the token value itself. This is
+a reconnaissance capability useful before escalating to higher-impact attacks.
+
+**Does the proxy stop me?** No. Only the `refresh_token` field is substituted; all
+other form fields pass through unchanged.
+
+**Rating:** Feasible. Standard POST body manipulation, no special prerequisites
+beyond the token endpoint being in the proxy's ruleset.
+
+**Mitigation:** Sanitize the token endpoint POST body to contain ONLY the fields
+Google's OAuth token endpoint requires (`grant_type`, `refresh_token`, `client_id`,
+`client_secret`), dropping all other fields. Log warnings when unexpected fields are
+present in the container's token endpoint requests.
+
+---
+
 ## Summary: Risk Matrix
 
 | ID | Vector | Impact | Feasibility | Mitigated? |
@@ -373,12 +475,14 @@ destinations but cannot stop MCP-directed abuse of allowlisted capabilities.
 | A8 | JWKS kid observation | Cross-container impersonation | Difficult | No |
 | A9 | Cert cache exhaustion | DoS | Infeasible now | No (planned) |
 | A10 | Data exfiltration via legitimate API ops | Data exfiltration | Feasible | No (by design) |
-| A11 | Shared mutator TOCTOU | Cross-container credential confusion | Feasible | Phase 3d |
+| A11 | Shared token cache across containers (architectural shared state) | Cross-container credential confusion | Feasible | Phase 3d |
 | A12 | WebSocket/H2 upgrade to evade inspection | Inspection bypass | Infeasible (Phase 3a) | Phase 3a ALPN |
 | A13 | Sibling container MITM via shared CA | Cross-container exfiltration | Difficult | Partial (CA lifecycle) |
 | A14 | Package registry publish exfiltration | Supply chain + data exfiltration | Feasible | No (policy-layer only) |
-| A15 | Reverse shell persistence | Full container compromise + human operator | Feasible | Partial (nftables ports 80/443 only) |
+| A15 | Reverse shell persistence | Full container compromise + human operator | Feasible | None (nftables planned Phase 3d; no current egress filtering for non-80/443 ports) |
 | A16 | MCP tool descriptor poisoning | Precision proxy-gap exploitation | Feasible | Partial (allowlist holds; not for permitted ops) |
+| A17 | Credential leakage via debug log stream | Full real credential value in log | Difficult (requires contributor error) | Partial (I6 upheld by convention, no structural redaction) |
+| A18 | Token endpoint field injection / validity probing | Scope/validity reconnaissance without seeing token | Feasible | No |
 
 ---
 
@@ -388,4 +492,4 @@ destinations but cannot stop MCP-directed abuse of allowlisted capabilities.
 
 2. **A2 (DNS-poisoned upstream redirect)** is the most catastrophic if it succeeds. The proxy should default to IP-pinning the resolved address of intercepted destinations at rule-load time and re-resolving with fail-closed behaviour if the IP changes mid-session. This is described as optional in U3 but should be promoted to mandatory for write-capable credentials.
 
-3. **A11 (shared mutator across containers)** is an architectural gap that affects any multi-container deployment before Phase 3d ships. The fix — per-container `OAuthRefreshMutator` instances bound to per-container sockets — is already in the roadmap. The risk window is the current prototype period.
+3. **A11 (shared token cache across containers)** is an architectural shared-state gap (not a TOCTOU race) that affects any multi-container deployment before Phase 3d ships. The `sync.RWMutex` is correct but does not help — the problem is a single shared `OAuthRefreshMutator` instance across all containers. The fix — per-container `OAuthRefreshMutator` instances bound to per-container sockets — is already in the roadmap. The risk window is the current prototype period.

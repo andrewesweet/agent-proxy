@@ -47,3 +47,97 @@ rules:
 		t.Errorf("expected 1 rule, got %d", len(rules.Hosts()))
 	}
 }
+
+func TestLoadConfig_NoRules(t *testing.T) {
+	path := writeTempConfig(t, `
+rules: []
+`)
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "at least one rule") {
+		t.Errorf("expected 'at least one rule' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_MissingHost(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - type: static
+    token_env: GH_TOKEN
+`)
+	// No need to set GH_TOKEN — validation fails on missing host
+	// before credential resolution is attempted.
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "host") {
+		t.Errorf("expected 'host' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_HostWithPort(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com:443
+    type: static
+    token_env: GH_TOKEN
+`)
+	t.Setenv("GH_TOKEN", "ghp_test")
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "port") {
+		t.Errorf("expected 'port' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_HostWithScheme(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: https://api.github.com
+    type: static
+    token_env: GH_TOKEN
+`)
+	t.Setenv("GH_TOKEN", "ghp_test")
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "scheme") {
+		t.Errorf("expected 'scheme' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_InvalidType(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com
+    type: weird
+`)
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "type") {
+		t.Errorf("expected 'type' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_DuplicateHost(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com
+    type: static
+    token_env: GH_TOKEN
+  - host: API.GITHUB.COM
+    type: static
+    token_env: GH_TOKEN
+`)
+	t.Setenv("GH_TOKEN", "ghp_test")
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("expected 'duplicate' error, got: %v", err)
+	}
+}
+
+func TestLoadConfig_UnknownField(t *testing.T) {
+	path := writeTempConfig(t, `
+rules:
+  - host: api.github.com
+    type: static
+    tokenfile: /some/path
+`)
+	_, _, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "field tokenfile") {
+		t.Errorf("expected 'field tokenfile' error, got: %v", err)
+	}
+}

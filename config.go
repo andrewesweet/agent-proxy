@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -76,6 +77,10 @@ func LoadConfig(path string) (*Config, *RuleSet, error) {
 		cfg.AuditLog.Level = "request"
 	}
 
+	if err := validate(&cfg); err != nil {
+		return nil, nil, err
+	}
+
 	// Build the RuleSet. Validation and credential resolution are in
 	// subsequent tasks — for now this is a minimal pass-through.
 	rules, err := buildRuleSet(&cfg)
@@ -84,6 +89,47 @@ func LoadConfig(path string) (*Config, *RuleSet, error) {
 	}
 
 	return &cfg, rules, nil
+}
+
+// validate checks structural invariants of the parsed config. It does
+// not resolve credentials — that happens in buildRuleSet.
+func validate(cfg *Config) error {
+	if len(cfg.Rules) == 0 {
+		return fmt.Errorf("config: at least one rule required")
+	}
+
+	seen := make(map[string]bool, len(cfg.Rules))
+	for i := range cfg.Rules {
+		rc := &cfg.Rules[i]
+
+		if rc.Host == "" {
+			return fmt.Errorf("rule %d: host required", i)
+		}
+		if strings.Contains(rc.Host, "://") {
+			return fmt.Errorf("rule %d (%s): host must not contain a scheme", i, rc.Host)
+		}
+		if strings.Contains(rc.Host, ":") {
+			return fmt.Errorf("rule %d (%s): host must not contain a port", i, rc.Host)
+		}
+
+		// Normalise host for duplicate detection.
+		lowered := strings.ToLower(rc.Host)
+		if seen[lowered] {
+			return fmt.Errorf("rule %d: duplicate host %q", i, rc.Host)
+		}
+		seen[lowered] = true
+
+		switch rc.Type {
+		case "static", "oauth_refresh", "oauth_bearer":
+			// ok
+		case "":
+			return fmt.Errorf("rule %d (%s): type required", i, rc.Host)
+		default:
+			return fmt.Errorf("rule %d (%s): unknown type %q (want static, oauth_refresh, or oauth_bearer)", i, rc.Host, rc.Type)
+		}
+	}
+
+	return nil
 }
 
 // buildRuleSet converts RuleConfig entries into Rule values wired to

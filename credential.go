@@ -39,6 +39,13 @@ func (m *staticTokenMutator) MutateResponse(_ context.Context, _ *http.Request, 
 	return nil
 }
 
+// LogValue implements slog.LogValuer, returning a redacted
+// representation that never exposes the stored credential. Protects
+// against accidental credential leakage via structured logging (A17).
+func (m *staticTokenMutator) LogValue() slog.Value {
+	return slog.StringValue("<staticTokenMutator>")
+}
+
 // StaticTokenMutator returns a CredentialMutator that sets a fixed header
 // value on every request. Suitable for PATs, API keys, and registry tokens.
 // Panics if headerName is empty or contains invalid characters.
@@ -113,6 +120,12 @@ func (m *OAuthRefreshMutator) AccessToken() (string, error) {
 		return "", fmt.Errorf("cached access token expired")
 	}
 	return m.cachedToken, nil
+}
+
+// LogValue implements slog.LogValuer, returning a redacted
+// representation that never exposes the stored credential.
+func (m *OAuthRefreshMutator) LogValue() slog.Value {
+	return slog.StringValue("<OAuthRefreshMutator>")
 }
 
 // isTokenEndpoint returns true if the request is a POST to a Google
@@ -295,6 +308,12 @@ func (m *OAuthBearerMutator) MutateRequest(_ context.Context, req *http.Request)
 // MutateResponse is a no-op for API hosts.
 func (m *OAuthBearerMutator) MutateResponse(_ context.Context, _ *http.Request, _ *http.Response) error {
 	return nil
+}
+
+// LogValue implements slog.LogValuer, returning a redacted
+// representation that never exposes the stored credential.
+func (m *OAuthBearerMutator) LogValue() slog.Value {
+	return slog.StringValue("<OAuthBearerMutator>")
 }
 
 // Rule maps a destination host to a credential mutator and optional

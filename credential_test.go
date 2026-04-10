@@ -2,11 +2,13 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -426,6 +428,25 @@ func TestOAuthBearerMutator_ErrorOnEmptyCache(t *testing.T) {
 	err := bearer.MutateRequest(context.Background(), req)
 	if err == nil {
 		t.Fatal("expected error on empty cache, got nil")
+	}
+}
+
+func TestMutatorsDoNotLeakViaLogValue(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	static := StaticTokenMutator("Authorization", "Bearer SECRET_TOKEN_123")
+	refresh := NewOAuthRefreshMutator("REAL_REFRESH_TOKEN_456")
+	bearer := NewOAuthBearerMutator(refresh)
+
+	logger.Info("mutators", "s", static, "r", refresh, "b", bearer)
+
+	out := buf.String()
+	if strings.Contains(out, "SECRET_TOKEN_123") {
+		t.Errorf("log leaked static token: %s", out)
+	}
+	if strings.Contains(out, "REAL_REFRESH_TOKEN_456") {
+		t.Errorf("log leaked refresh token: %s", out)
 	}
 }
 

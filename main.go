@@ -29,16 +29,18 @@ import (
 	"encoding/pem"
 	"errors"
 	"flag"
-	"io/fs"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -97,14 +99,22 @@ func main() {
 }
 
 // listen binds a net.Listener based on the configured address. A
-// "unix://" prefix creates a Unix domain socket with mode 0600. Any
-// other value is interpreted as a TCP address. Stale socket files are
-// removed before binding; non-socket files at the path produce an error.
+// "unix://" prefix creates a Unix domain socket with mode 0600
+// (enforced via umask for atomic creation). The path must be absolute.
+// Any other value is interpreted as a TCP address. Stale socket files
+// are removed before binding; non-socket files at the path produce an
+// error.
 func listen(address string) (net.Listener, error) {
 	if !strings.HasPrefix(address, "unix://") {
 		return net.Listen("tcp", address)
 	}
 	path := strings.TrimPrefix(address, "unix://")
+	if path == "" {
+		return nil, fmt.Errorf("listen unix: empty path")
+	}
+	if !filepath.IsAbs(path) {
+		return nil, fmt.Errorf("listen unix %q: path must be absolute", path)
+	}
 
 	// Check for existing file and remove if it's a stale socket.
 	info, err := os.Stat(path)
@@ -122,10 +132,19 @@ func listen(address string) (net.Listener, error) {
 		return nil, fmt.Errorf("stat listen path %q: %w", path, err)
 	}
 
+	// Set umask 0o177 so the socket is created with mode 0600
+	// atomically (closes the TOCTOU window between net.Listen and
+	// os.Chmod). syscall.Umask returns the previous value.
+	oldMask := syscall.Umask(0o177)
+	defer syscall.Umask(oldMask)
+
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, fmt.Errorf("listen unix %q: %w", path, err)
 	}
+	// Belt-and-braces: also chmod explicitly, in case umask was
+	// overridden by an LSM or the kernel created the node with
+	// unexpected permissions.
 	if err := os.Chmod(path, 0o600); err != nil {
 		ln.Close()
 		return nil, fmt.Errorf("chmod socket %q: %w", path, err)
@@ -291,12 +310,15 @@ func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *ht
 					"allow_methods", rule.AllowMethods,
 				)
 				resp := &http.Response{
-					StatusCode:    http.StatusMethodNotAllowed,
-					Status:        "405 Method Not Allowed",
-					Proto:         "HTTP/1.1",
-					ProtoMajor:    1,
-					ProtoMinor:    1,
-					Header:        http.Header{"Content-Length": {"0"}},
+					StatusCode: http.StatusMethodNotAllowed,
+					Status:     "405 Method Not Allowed",
+					Proto:      "HTTP/1.1",
+					ProtoMajor: 1,
+					ProtoMinor: 1,
+					Header: http.Header{
+						"Content-Length": {"0"},
+						"Allow":          {strings.Join(rule.AllowMethods, ", ")},
+					},
 					Body:          io.NopCloser(strings.NewReader("")),
 					ContentLength: 0,
 				}

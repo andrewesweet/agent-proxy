@@ -532,9 +532,12 @@ func TestMethodBlockedByAllowMethods(t *testing.T) {
 	proxyCA := x509.NewCertPool()
 	proxyCA.AddCert(ca)
 
-	status := doProxyPostStatus(t, ln.Addr().String(), "test.example.com", "/api", "data=evil", proxyCA)
+	status, hdr := doProxyPostStatusAndHeaders(t, ln.Addr().String(), "test.example.com", "/api", "data=evil", proxyCA)
 	if status != 405 {
 		t.Errorf("status = %d, want 405", status)
+	}
+	if allow := hdr.Get("Allow"); allow != "GET, HEAD" {
+		t.Errorf("Allow header = %q, want %q", allow, "GET, HEAD")
 	}
 	if upstreamHit {
 		t.Error("upstream was hit despite POST not in AllowMethods")
@@ -578,6 +581,45 @@ func doProxyPostStatus(t *testing.T, proxyAddr, destHost, path, body string, pro
 	}
 	defer innerResp.Body.Close()
 	return innerResp.StatusCode
+}
+
+// doProxyPostStatusAndHeaders sends a POST through the proxy and
+// returns both the status code and response headers.
+func doProxyPostStatusAndHeaders(t *testing.T, proxyAddr, destHost, path, body string, proxyCA *x509.CertPool) (int, http.Header) {
+	t.Helper()
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+
+	fmt.Fprintf(conn, "CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n", destHost, destHost)
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("CONNECT failed: %v status=%d", err, resp.StatusCode)
+	}
+
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName: destHost,
+		RootCAs:    proxyCA,
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("tls: %v", err)
+	}
+	defer tlsConn.Close()
+
+	reqStr := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		path, destHost, len(body), body)
+	io.WriteString(tlsConn, reqStr)
+
+	innerResp, err := http.ReadResponse(bufio.NewReader(tlsConn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer innerResp.Body.Close()
+	return innerResp.StatusCode, innerResp.Header
 }
 
 // TestUnixSocketListen verifies the proxy can bind to a Unix socket

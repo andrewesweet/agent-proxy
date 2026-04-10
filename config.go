@@ -96,24 +96,25 @@ func LoadConfig(path string) (*Config, *RuleSet, error) {
 		return nil, nil, err
 	}
 
-	if !strings.HasPrefix(cfg.Listen, "unix://") && cfg.ListenAllowTCP {
+	if !strings.HasPrefix(cfg.Listen, "unix://") {
 		slog.Warn("listen address is TCP — any host process can reach the proxy",
 			"listen", cfg.Listen,
 			"note", "per-container Unix sockets (Phase 3d-4) will supersede this (STRIDE Trust Boundary C)",
 		)
 	}
 
-	// Build the RuleSet. Validation and credential resolution are in
-	// subsequent tasks — for now this is a minimal pass-through.
+	// T10: log config hash for tamper detection. Logged before
+	// buildRuleSet so the hash is recorded even if credential
+	// resolution fails.
+	hash := sha256.Sum256(data)
+	absPath, _ := filepath.Abs(path)
+	slog.Info("config loaded", "path", absPath, "sha256", hex.EncodeToString(hash[:]))
+
+	// Build the RuleSet.
 	rules, err := buildRuleSet(&cfg)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	// T10: log config hash for tamper detection.
-	hash := sha256.Sum256(data)
-	absPath, _ := filepath.Abs(path)
-	slog.Info("config loaded", "path", absPath, "sha256", hex.EncodeToString(hash[:]))
 
 	// T15: warn on known publish endpoints without read-only allow_methods.
 	for _, rc := range cfg.Rules {
@@ -192,6 +193,25 @@ func validate(cfg *Config) error {
 		}
 	}
 
+	// oauth_bearer source linkage: the token_source must reference a
+	// preceding oauth_refresh rule. Detected in validate() so we fail
+	// fast before any credential resolution.
+	refreshHosts := make(map[string]bool)
+	for i := range cfg.Rules {
+		rc := &cfg.Rules[i]
+		switch rc.Type {
+		case "oauth_refresh":
+			refreshHosts[strings.ToLower(rc.Host)] = true
+		case "oauth_bearer":
+			if rc.TokenSource == "" {
+				return fmt.Errorf("rule %d (%s): oauth_bearer requires token_source", i, rc.Host)
+			}
+			if !refreshHosts[strings.ToLower(rc.TokenSource)] {
+				return fmt.Errorf("rule %d (%s): token_source %q does not reference a preceding oauth_refresh rule", i, rc.Host, rc.TokenSource)
+			}
+		}
+	}
+
 	// CA: both set or both empty.
 	hasCert := cfg.CA.CertFile != ""
 	hasKey := cfg.CA.KeyFile != ""
@@ -238,7 +258,7 @@ func buildRuleSet(cfg *Config) (*RuleSet, error) {
 		case "static":
 			m, err := buildStaticMutator(rc)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("rule %d: %w", i, err)
 			}
 			mutator = m
 
@@ -252,14 +272,10 @@ func buildRuleSet(cfg *Config) (*RuleSet, error) {
 			mutator = refresh
 
 		case "oauth_bearer":
-			if rc.TokenSource == "" {
-				return nil, fmt.Errorf("rule %d (%s): oauth_bearer requires token_source", i, rc.Host)
-			}
+			// Structural validation (token_source presence and
+			// oauth_refresh reference) was already done in validate().
 			srcHost := strings.ToLower(rc.TokenSource)
-			refresh, ok := refreshByHost[srcHost]
-			if !ok {
-				return nil, fmt.Errorf("rule %d (%s): token_source %q does not reference a preceding oauth_refresh rule", i, rc.Host, rc.TokenSource)
-			}
+			refresh := refreshByHost[srcHost]
 			mutator = NewOAuthBearerMutator(refresh)
 		}
 
@@ -287,7 +303,7 @@ func buildRuleSet(cfg *Config) (*RuleSet, error) {
 func buildStaticMutator(rc *RuleConfig) (CredentialMutator, error) {
 	token, err := resolveCredential(rc.TokenFile, rc.TokenEnv, "token")
 	if err != nil {
-		return nil, fmt.Errorf("rule (%s): %w", rc.Host, err)
+		return nil, fmt.Errorf("(%s): %w", rc.Host, err)
 	}
 
 	header := rc.Header
@@ -297,7 +313,7 @@ func buildStaticMutator(rc *RuleConfig) (CredentialMutator, error) {
 	// Validate header before calling StaticTokenMutator, which would panic.
 	for _, c := range header {
 		if c <= ' ' || c == ':' || c >= 0x7f {
-			return nil, fmt.Errorf("rule (%s): invalid character %q in header %q", rc.Host, c, header)
+			return nil, fmt.Errorf("(%s): invalid character %q in header %q", rc.Host, c, header)
 		}
 	}
 

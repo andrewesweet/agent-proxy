@@ -52,7 +52,7 @@ func TestStaticGitHubTokenMutator(t *testing.T) {
 func TestRuleSetMatch(t *testing.T) {
 	rs := NewRuleSet(
 		Rule{Host: "api.github.com", Mutator: StaticGitHubTokenMutator("gh-pat")},
-		Rule{Host: "registry.npmjs.org", Mutator: StaticBearerMutator("npm-token")},
+		Rule{Host: "registry.npmjs.org", Mutator: StaticBearerMutator("npm-token"), AllowMethods: []string{"GET", "HEAD"}},
 		Rule{Host: "api.anthropic.com", Mutator: StaticTokenMutator("x-api-key", "sk-ant-xxx")},
 	)
 
@@ -68,13 +68,19 @@ func TestRuleSetMatch(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		m := rs.Match(tt.host)
-		if tt.wantNil && m != nil {
+		r := rs.Match(tt.host)
+		if tt.wantNil && r != nil {
 			t.Errorf("Match(%q) = non-nil, want nil", tt.host)
 		}
-		if !tt.wantNil && m == nil {
+		if !tt.wantNil && r == nil {
 			t.Errorf("Match(%q) = nil, want non-nil", tt.host)
 		}
+	}
+
+	// Verify AllowMethods is carried through.
+	r := rs.Match("registry.npmjs.org")
+	if r == nil || len(r.AllowMethods) != 2 {
+		t.Errorf("expected AllowMethods=[GET HEAD], got %v", r)
 	}
 }
 

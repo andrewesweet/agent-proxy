@@ -149,8 +149,8 @@ func (p *proxy) handleConn(clientConn net.Conn) {
 
 	slog.Debug("connect", "host", host, "dest", req.Host)
 
-	if mutator := p.rules.Match(host); mutator != nil {
-		p.handleMITM(clientConn, br, req, host, mutator)
+	if rule := p.rules.Match(host); rule != nil {
+		p.handleMITM(clientConn, br, req, host, rule)
 	} else if p.allowPassthrough {
 		p.handlePassthrough(clientConn, br, req)
 	} else {
@@ -162,7 +162,7 @@ func (p *proxy) handleConn(clientConn net.Conn) {
 // handleMITM performs TLS interception: we tell the client CONNECT succeeded,
 // perform a TLS handshake using a generated cert, read the plaintext HTTP
 // request, inject credentials, and forward to the real destination.
-func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *http.Request, destHost string, mutator CredentialMutator) {
+func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *http.Request, destHost string, rule *Rule) {
 	// Tell client CONNECT succeeded. We don't pre-dial upstream here;
 	// each HTTP request is forwarded independently via the transport.
 	fmt.Fprintf(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -240,7 +240,7 @@ func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *ht
 		}
 
 		// Inject credential via the mutator.
-		if err := mutator.MutateRequest(context.Background(), req); err != nil {
+		if err := rule.Mutator.MutateRequest(context.Background(), req); err != nil {
 			slog.Error("credential injection failed", "host", destHost, "error", err)
 			// E1: write 502 instead of bare connection teardown.
 			errResp := &http.Response{
@@ -301,7 +301,7 @@ func (p *proxy) handleMITM(clientConn net.Conn, br *bufio.Reader, connectReq *ht
 		)
 
 		// Invoke response mutation (e.g., OAuth token caching/replacement).
-		if err := mutator.MutateResponse(context.Background(), req, resp); err != nil {
+		if err := rule.Mutator.MutateResponse(context.Background(), req, resp); err != nil {
 			slog.Error("response mutation failed", "host", destHost, "error", err)
 			resp.Body.Close()
 			errResp := &http.Response{

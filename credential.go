@@ -297,14 +297,22 @@ func (m *OAuthBearerMutator) MutateResponse(_ context.Context, _ *http.Request, 
 	return nil
 }
 
-// Rule maps a destination host to a credential mutator.
+// Rule maps a destination host to a credential mutator and optional
+// method allowlist.
 type Rule struct {
 	// Host is the destination hostname to match (exact match).
-	// Wildcard support (*.example.com) is planned for Phase 3d.
+	// Wildcard support (*.example.com) is planned for Phase 3d-2.
 	Host string
 
 	// Mutator injects credentials into requests to this host.
 	Mutator CredentialMutator
+
+	// AllowMethods, if non-empty, restricts credential injection to
+	// requests using one of the listed HTTP methods. Empty means all
+	// methods are permitted. Values must be uppercase HTTP method
+	// tokens (GET, HEAD, POST, etc.) — validation is performed by
+	// LoadConfig at startup.
+	AllowMethods []string
 }
 
 // RuleSet holds an ordered list of rules and provides lookup by host.
@@ -323,13 +331,13 @@ func NewRuleSet(rules ...Rule) *RuleSet {
 	return &RuleSet{rules: normalized}
 }
 
-// Match returns the CredentialMutator for the given host, or nil if no
-// rule matches. Host comparison is case-insensitive. First match wins.
-func (rs *RuleSet) Match(host string) CredentialMutator {
+// Match returns the rule for the given host, or nil if no rule matches.
+// Host comparison is case-insensitive. First match wins.
+func (rs *RuleSet) Match(host string) *Rule {
 	host = strings.ToLower(host)
-	for _, r := range rs.rules {
-		if r.Host == host {
-			return r.Mutator
+	for i := range rs.rules {
+		if rs.rules[i].Host == host {
+			return &rs.rules[i]
 		}
 	}
 	return nil

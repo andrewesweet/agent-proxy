@@ -46,28 +46,25 @@ Task 4 (basic validation: rules count, host format, type enum, duplicates)
 Task 5 (CA half-population + audit_log schema validation)
     │
     ▼
-Task 6 (credential resolution: file/env, mutual exclusion, trim)
+Task 6 (credential resolution + full rule construction)
     │
     ▼
-Task 7 (rule construction: static, oauth_refresh, oauth_bearer, header validation)
+Task 7 (credential field zeroing after resolution)
     │
     ▼
-Task 8 (credential field zeroing after resolution)
+Task 8 (allow_methods validation + enforcement in handleMITM)
     │
     ▼
-Task 9 (allow_methods validation + enforcement in handleMITM)
+Task 9 (SHA-256 config hash logging + registry publish warning)
     │
     ▼
-Task 10 (SHA-256 config hash logging + registry publish warning)
+Task 10 (Unix socket listener + listen_allow_tcp opt-in)
     │
     ▼
-Task 11 (Unix socket listener + listen_allow_tcp opt-in)
+Task 11 (main.go rewrite + integration test)
     │
     ▼
-Task 12 (main.go rewrite + integration test)
-    │
-    ▼
-Task 13 (adversarial review)
+Task 12 (adversarial review)
 ```
 
 ---
@@ -122,9 +119,20 @@ EOF
 **Files:**
 - Modify: `credential.go` (add `AllowMethods` to `Rule`, change `Match` return type)
 - Modify: `credential_test.go` (update `TestRuleSetMatch` for new signature)
-- Modify: `main.go:152` (update call site to `rules.Match`)
+- Modify: `main.go` (update 3 call sites; see Step 4)
 
 This task changes an API surface but does not yet enforce `AllowMethods`. Enforcement comes in Task 9. This task is split off because the signature change ripples through multiple files.
+
+**All call sites to change in `main.go`** (verified against the current file):
+
+| Location (approximate line) | Current | After |
+|----|---------|-------|
+| ~152 | `if mutator := p.rules.Match(host); mutator != nil { p.handleMITM(..., mutator) }` | `if rule := p.rules.Match(host); rule != nil { p.handleMITM(..., rule) }` |
+| ~165 | `func (p *proxy) handleMITM(..., mutator CredentialMutator)` | `func (p *proxy) handleMITM(..., rule *Rule)` |
+| ~243 | `if err := mutator.MutateRequest(...)` | `if err := rule.Mutator.MutateRequest(...)` |
+| ~304 | `if err := mutator.MutateResponse(...)` | `if err := rule.Mutator.MutateResponse(...)` |
+
+The engineer MUST change all four locations atomically. A partial change will not compile.
 
 - [ ] **Step 1: Write failing test for new Match signature**
 
@@ -560,7 +568,8 @@ rules:
   - type: static
     token_env: GH_TOKEN
 `)
-	t.Setenv("GH_TOKEN", "ghp_test")
+	// No need to set GH_TOKEN — validation fails on missing host
+	// before credential resolution is attempted.
 	_, _, err := LoadConfig(path)
 	if err == nil || !strings.Contains(err.Error(), "host") {
 		t.Errorf("expected 'host' error, got: %v", err)
@@ -855,7 +864,7 @@ Expected: new tests FAIL.
 
 - [ ] **Step 3: Extend validate()**
 
-Add to the bottom of `validate` in `config.go`, after the rules loop:
+In `config.go`, find the existing `return nil` at the end of `validate()` (from Task 4). REPLACE that single `return nil` with the following block, which adds CA and audit log validation and then returns nil at the end:
 
 ```go
 	// CA: both set or both empty.
@@ -889,7 +898,7 @@ Add to the bottom of `validate` in `config.go`, after the rules loop:
 	return nil
 ```
 
-Note: the `return nil` that was at the end of `validate` is now replaced by this new block. Make sure there is only one `return nil` at the bottom.
+After this edit, `validate()` must have exactly ONE `return nil` at the very end. If you accidentally leave two, the compiler will flag the second as unreachable.
 
 Update imports to add `path/filepath`:
 
@@ -941,13 +950,13 @@ EOF
 
 ---
 
-## Task 6: Credential Resolution
+## Task 6: Credential Resolution + Full Rule Construction
 
 **Files:**
-- Modify: `config.go` (add credential resolution helper)
-- Modify: `config_test.go` (add resolution tests)
+- Modify: `config.go` (add credential resolution helper AND full `buildRuleSet`)
+- Modify: `config_test.go` (add resolution and rule type tests)
 
-This task adds `resolveCredential(fileField, envField, fieldLabel string)` that reads the credential value, trims whitespace, and returns errors for empty/both-set/neither cases.
+This task adds the `resolveCredential` helper AND wires it into a complete `buildRuleSet` that handles all three rule types (`static`, `oauth_refresh`, `oauth_bearer`). These are merged into one task because the resolver alone is unused code — committing it without the wiring creates a commit where the new tests fail.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -1042,7 +1051,7 @@ rules:
 }
 ```
 
-Add `context` and `net/http` to the test file imports if not already present:
+Update the `import (...)` block at the top of `config_test.go` to include `context` and `net/http` (if they're not already there). After the update, the import block should read:
 
 ```go
 import (
@@ -1055,95 +1064,7 @@ import (
 )
 ```
 
-- [ ] **Step 2: Run to confirm failures**
-
-Run:
-```bash
-go test -v -count=1 -run "TestLoadConfig_Static|TestLoadConfig_Whitespace|TestLoadConfig_TokenEnv" ./...
-```
-
-Expected: most tests FAIL (some may pass because the Task 3 minimal build handles token_env).
-
-- [ ] **Step 3: Add credential resolution helper**
-
-In `config.go`, add this function near the bottom (before `validate`):
-
-```go
-// resolveCredential reads a credential value from either a file path
-// or an env var name. Exactly one of fileVal/envVal must be non-empty.
-// The result is trimmed of whitespace; an empty post-trim result is an
-// error.
-func resolveCredential(fileVal, envVal, fieldLabel string) (string, error) {
-	fileSet := fileVal != ""
-	envSet := envVal != ""
-
-	switch {
-	case fileSet && envSet:
-		return "", fmt.Errorf("%s: exactly one of _file or _env must be set (both provided)", fieldLabel)
-	case !fileSet && !envSet:
-		return "", fmt.Errorf("%s: exactly one of %s_file or %s_env required (neither provided)", fieldLabel, fieldLabel, fieldLabel)
-	}
-
-	var raw string
-	if fileSet {
-		data, err := os.ReadFile(fileVal)
-		if err != nil {
-			return "", fmt.Errorf("%s: read file %q: %w", fieldLabel, fileVal, err)
-		}
-		raw = string(data)
-	} else {
-		raw = os.Getenv(envVal)
-	}
-
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return "", fmt.Errorf("%s: resolved value is empty", fieldLabel)
-	}
-	return trimmed, nil
-}
-```
-
-- [ ] **Step 4: Run the tests (still failing — resolver is unused)**
-
-The resolver exists but `buildRuleSet` doesn't call it yet. That's Task 7. For now, check compilation:
-
-Run:
-```bash
-go build ./...
-```
-
-Expected: build succeeds.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add config.go config_test.go
-git commit -m "$(cat <<'EOF'
-feat: add credential resolution helper
-
-resolveCredential enforces mutual exclusion of _file/_env, reads the
-credential from the selected source, trims whitespace, and rejects
-empty post-trim values. Not yet wired to buildRuleSet — rule
-construction using this helper lands in the next commit.
-
-Tests for the resolution behaviour are in place and will pass once
-buildRuleSet is updated in the next task.
-
-EOF
-)"
-```
-
----
-
-## Task 7: Rule Construction (static, oauth_refresh, oauth_bearer)
-
-**Files:**
-- Modify: `config.go` (full `buildRuleSet`, header validation)
-- Modify: `config_test.go` (add oauth tests)
-
-- [ ] **Step 1: Write failing tests for oauth rule types**
-
-Add to `config_test.go`:
+Add the oauth and header-validation tests as well (same Step 1; these go into the same commit as the resolver):
 
 ```go
 func TestLoadConfig_OAuthRefresh(t *testing.T) {
@@ -1162,7 +1083,6 @@ rules:
 	if r == nil {
 		t.Fatal("no rule for oauth2.googleapis.com")
 	}
-	// Verify mutator is *OAuthRefreshMutator.
 	if _, ok := r.Mutator.(*OAuthRefreshMutator); !ok {
 		t.Errorf("mutator = %T, want *OAuthRefreshMutator", r.Mutator)
 	}
@@ -1254,7 +1174,6 @@ rules:
 	if err := r.Mutator.MutateRequest(context.Background(), req); err != nil {
 		t.Fatalf("MutateRequest: %v", err)
 	}
-	// Default prefix is "Bearer ", default header is "Authorization".
 	if got := req.Header.Get("Authorization"); got != "Bearer ghp_test" {
 		t.Errorf("Authorization = %q, want %q", got, "Bearer ghp_test")
 	}
@@ -1265,14 +1184,51 @@ rules:
 
 Run:
 ```bash
-go test -v -count=1 -run "TestLoadConfig_OAuth|TestLoadConfig_Static" ./...
+go test -v -count=1 -run TestLoadConfig ./...
 ```
 
-Expected: new tests FAIL.
+Expected: most new tests FAIL. The Task 3 minimal `buildRuleSet` handles only a subset of cases, so tests for oauth rules, file-based tokens, and error paths fail.
 
-- [ ] **Step 3: Replace buildRuleSet with full implementation**
+- [ ] **Step 3: Add credential resolution helper AND full buildRuleSet**
 
-In `config.go`, replace the minimal `buildRuleSet` with:
+In `config.go`, add the `resolveCredential` helper near the bottom (before `validate`):
+
+```go
+// resolveCredential reads a credential value from either a file path
+// or an env var name. Exactly one of fileVal/envVal must be non-empty.
+// The result is trimmed of whitespace; an empty post-trim result is an
+// error.
+func resolveCredential(fileVal, envVal, fieldLabel string) (string, error) {
+	fileSet := fileVal != ""
+	envSet := envVal != ""
+
+	switch {
+	case fileSet && envSet:
+		return "", fmt.Errorf("%s: exactly one of _file or _env must be set (both provided)", fieldLabel)
+	case !fileSet && !envSet:
+		return "", fmt.Errorf("%s: exactly one of %s_file or %s_env required (neither provided)", fieldLabel, fieldLabel, fieldLabel)
+	}
+
+	var raw string
+	if fileSet {
+		data, err := os.ReadFile(fileVal)
+		if err != nil {
+			return "", fmt.Errorf("%s: read file %q: %w", fieldLabel, fileVal, err)
+		}
+		raw = string(data)
+	} else {
+		raw = os.Getenv(envVal)
+	}
+
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", fmt.Errorf("%s: resolved value is empty", fieldLabel)
+	}
+	return trimmed, nil
+}
+```
+
+Now replace the minimal `buildRuleSet` from Task 3 with the full implementation:
 
 ```go
 // buildRuleSet resolves credentials, constructs mutators, and assembles
@@ -1377,13 +1333,16 @@ Expected: all tests pass.
 ```bash
 git add config.go config_test.go
 git commit -m "$(cat <<'EOF'
-feat: full rule construction for static, oauth_refresh, oauth_bearer
+feat: credential resolution and full rule construction
 
-buildRuleSet now resolves credentials via resolveCredential, constructs
-the appropriate mutator based on rule type, validates header field
-before calling StaticTokenMutator (preventing panics), and wires
-oauth_bearer rules to their referenced oauth_refresh mutator. Header
-and prefix defaults ("Authorization" and "Bearer ") are applied.
+Adds resolveCredential helper (mutual exclusion of _file/_env,
+whitespace trim, empty rejection) and wires it into buildRuleSet,
+which now constructs the appropriate mutator for each rule type:
+StaticTokenMutator for static (with header validation to prevent
+panics and "Authorization"/"Bearer " defaults), OAuthRefreshMutator
+for oauth_refresh, OAuthBearerMutator for oauth_bearer (linked to a
+previously-defined oauth_refresh rule via case-insensitive host match
+on token_source).
 
 EOF
 )"
@@ -1391,7 +1350,7 @@ EOF
 
 ---
 
-## Task 8: Credential Field Zeroing (A17 Mitigation)
+## Task 7: Credential Field Zeroing (A17 Mitigation)
 
 **Files:**
 - Modify: `config.go` (zero credential fields after resolution)
@@ -1505,7 +1464,7 @@ EOF
 
 ---
 
-## Task 9: allow_methods Validation and Runtime Enforcement
+## Task 8: allow_methods Validation and Runtime Enforcement
 
 **Files:**
 - Modify: `config.go` (validate `AllowMethods` values)
@@ -1647,14 +1606,14 @@ Expected: FAIL.
 In `config.go`, in `validate`, add this block inside the per-rule loop (after the type switch):
 
 ```go
-		// allow_methods validation.
+		// allow_methods validation: uppercase ASCII letters only.
 		for _, m := range rc.AllowMethods {
 			if m == "" {
 				return fmt.Errorf("rule %d (%s): allow_methods entry is empty", i, rc.Host)
 			}
 			for _, c := range m {
-				if !((c >= 'A' && c <= 'Z') || c == '-') {
-					return fmt.Errorf("rule %d (%s): allow_methods entry %q must be uppercase HTTP method token", i, rc.Host, m)
+				if c < 'A' || c > 'Z' {
+					return fmt.Errorf("rule %d (%s): allow_methods entry %q must be uppercase HTTP method token (A-Z only)", i, rc.Host, m)
 				}
 			}
 		}
@@ -1810,7 +1769,7 @@ EOF
 
 ---
 
-## Task 10: Config Hash Logging and Registry Warning
+## Task 9: Config Hash Logging and Registry Warning
 
 **Files:**
 - Modify: `config.go` (hash logging, registry warning)
@@ -1818,16 +1777,35 @@ EOF
 
 - [ ] **Step 1: Write failing tests**
 
-Add to `config_test.go`:
+First, **merge these new packages into the existing `import (...)` block at the top of `config_test.go`** (do NOT paste a second import block — Go allows only one import declaration at the top of the file):
+
+```
+bytes
+crypto/sha256
+encoding/hex
+log/slog
+```
+
+After the merge, the full import block at the top of `config_test.go` should be:
 
 ```go
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
 )
+```
 
+Then add the helper and tests at the bottom of `config_test.go`:
+
+```go
 func captureSlog(t *testing.T, fn func()) string {
 	t.Helper()
 	var buf bytes.Buffer
@@ -1912,23 +1890,6 @@ rules:
 		t.Errorf("warning should be suppressed with read-only allow_methods; got: %s", out)
 	}
 }
-```
-
-Update the import block in `config_test.go` to include the new imports. The full import block should be:
-
-```go
-import (
-	"bytes"
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"log/slog"
-	"net/http"
-	"os"
-	"path/filepath"
-	"strings"
-	"testing"
-)
 ```
 
 - [ ] **Step 2: Run to confirm failures**
@@ -2063,7 +2024,7 @@ EOF
 
 ---
 
-## Task 11: Unix Socket Listener with listen_allow_tcp Opt-in
+## Task 10: Unix Socket Listener with listen_allow_tcp Opt-in
 
 **Files:**
 - Modify: `config.go` (validate listen address)
@@ -2260,7 +2221,26 @@ func TestUnixSocketListen_ExistingNonSocketFile(t *testing.T) {
 }
 ```
 
-Add `path/filepath` to the `main_test.go` import block if not already present.
+Ensure the `main_test.go` import block includes `path/filepath` and `os` (the Unix socket tests use both). After this step, the import block should contain at least:
+
+```go
+import (
+	"bufio"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+```
 
 - [ ] **Step 2: Run to confirm failures**
 
@@ -2314,14 +2294,18 @@ func listen(address string) (net.Listener, error) {
 	path := strings.TrimPrefix(address, "unix://")
 
 	// Check for existing file and remove if it's a stale socket.
-	if info, err := os.Stat(path); err == nil {
+	info, err := os.Stat(path)
+	switch {
+	case err == nil:
 		if info.Mode()&os.ModeSocket == 0 {
 			return nil, fmt.Errorf("listen path %q exists and is not a socket", path)
 		}
 		if err := os.Remove(path); err != nil {
 			return nil, fmt.Errorf("remove stale socket %q: %w", path, err)
 		}
-	} else if !os.IsNotExist(err) {
+	case errors.Is(err, fs.ErrNotExist):
+		// Path doesn't exist — proceed to bind.
+	default:
 		return nil, fmt.Errorf("stat listen path %q: %w", path, err)
 	}
 
@@ -2336,6 +2320,8 @@ func listen(address string) (net.Listener, error) {
 	return ln, nil
 }
 ```
+
+Ensure `main.go` imports include `errors` (already present from the `errors.Is(err, net.ErrClosed)` call) and `io/fs`. Add `io/fs` to the import block.
 
 - [ ] **Step 5: Run the tests**
 
@@ -2380,7 +2366,7 @@ EOF
 
 ---
 
-## Task 12: main.go Rewrite and Integration Test
+## Task 11: main.go Rewrite and Integration Test
 
 **Files:**
 - Modify: `main.go` (replace all flags with `-config`, call `LoadConfig`, use `listen`)
@@ -2580,7 +2566,7 @@ EOF
 
 ---
 
-## Task 13: Adversarial Code Review
+## Task 12: Adversarial Code Review
 
 Commission an adversarial review of the completed Phase 3d-1 implementation.
 

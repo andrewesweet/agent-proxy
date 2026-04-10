@@ -43,20 +43,24 @@ import (
 )
 
 func main() {
-	listen := flag.String("listen", ":18080", "proxy listen address")
-	destHost := flag.String("dest", "api.github.com", "destination host to intercept (all others are passthrough)")
-	token := flag.String("token", "", "bearer token to inject for the destination host")
-	headerName := flag.String("header", "Authorization", "header name for credential injection")
-	headerPrefix := flag.String("header-prefix", "token ", "prefix before the token value (e.g., 'Bearer ', 'token ')")
-	caCertPath := flag.String("ca-cert", "", "path to CA certificate PEM (generated if empty)")
-	caKeyPath := flag.String("ca-key", "", "path to CA private key PEM (generated if empty)")
+	configPath := flag.String("config", "", "path to YAML config file")
 	flag.Parse()
+
+	if *configPath == "" {
+		fmt.Fprintf(os.Stderr, "usage: agent-proxy -config <path>\n")
+		os.Exit(1)
+	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	slog.SetDefault(logger)
 
-	// Load or generate CA.
-	ca, caKey, err := loadOrGenerateCA(*caCertPath, *caKeyPath)
+	cfg, rules, err := LoadConfig(*configPath)
+	if err != nil {
+		slog.Error("config load failed", "error", err)
+		os.Exit(1)
+	}
+
+	ca, caKey, err := loadOrGenerateCA(cfg.CA.CertFile, cfg.CA.KeyFile)
 	if err != nil {
 		slog.Error("ca setup failed", "error", err)
 		os.Exit(1)
@@ -65,12 +69,6 @@ func main() {
 
 	certCache := newCertCache(ca, caKey)
 
-	// Build rules from CLI flags. In future phases this will come from
-	// a config file or per-container socket identity.
-	rules := NewRuleSet(Rule{
-		Host:    *destHost,
-		Mutator: StaticTokenMutator(*headerName, *headerPrefix+*token),
-	})
 	slog.Info("rules loaded", "rules", rules.String())
 
 	p := &proxy{
@@ -78,7 +76,7 @@ func main() {
 		certCache: certCache,
 	}
 
-	ln, err := net.Listen("tcp", *listen)
+	ln, err := listen(cfg.Listen)
 	if err != nil {
 		slog.Error("listen failed", "error", err)
 		os.Exit(1)

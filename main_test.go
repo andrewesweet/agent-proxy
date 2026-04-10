@@ -700,6 +700,82 @@ func TestUnixSocketListen_ExistingNonSocketFile(t *testing.T) {
 	}
 }
 
+// TestConfigDrivenProxy verifies the full flow from a YAML config file
+// through LoadConfig to a working proxy that injects static tokens.
+func TestConfigDrivenProxy(t *testing.T) {
+	var gotAuth string
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		fmt.Fprintf(w, `{"ok":true}`)
+	}))
+	defer upstream.Close()
+
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte("ghp_from_config"), 0o600); err != nil {
+		t.Fatalf("write token: %v", err)
+	}
+
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	cfgBody := fmt.Sprintf(`
+listen: ":0"
+listen_allow_tcp: true
+rules:
+  - host: test.example.com
+    type: static
+    prefix: "token "
+    token_file: %s
+`, tokenPath)
+	if err := os.WriteFile(cfgPath, []byte(cfgBody), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, rules, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	ca, caKey, _ := generateEphemeralCA()
+	cc := newCertCache(ca, caKey)
+	upstreamAddr := upstream.Listener.Addr().String()
+
+	p := &proxy{
+		transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if h, _, _ := net.SplitHostPort(addr); h == "test.example.com" {
+					addr = upstreamAddr
+				}
+				return net.DialTimeout(network, addr, 5*time.Second)
+			},
+		},
+		rules:     rules,
+		certCache: cc,
+	}
+
+	ln, err := listen(cfg.Listen)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go p.handleConn(conn)
+		}
+	}()
+
+	proxyCA := x509.NewCertPool()
+	proxyCA.AddCert(ca)
+	doProxyRequest(t, ln.Addr().String(), "test.example.com", proxyCA)
+
+	if gotAuth != "token ghp_from_config" {
+		t.Errorf("Authorization = %q, want %q", gotAuth, "token ghp_from_config")
+	}
+}
+
 // doProxyPost sends a POST request through the proxy and returns the response body.
 func doProxyPost(t *testing.T, proxyAddr, destHost, path, body string, proxyCA *x509.CertPool) string {
 	t.Helper()
